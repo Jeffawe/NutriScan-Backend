@@ -1,0 +1,96 @@
+# Logs
+logs/
+*.log
+*.out
+*.pid
+*.seed
+*.bak
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# Virtual Environments
+venv/
+env/
+ENV/
+.Python
+__pycache__/
+*.py[cod]
+api/.env
+
+# Django
+db.sqlite3
+*.sqlite3
+*.db
+*.db-journal
+/media/
+staticfiles/
+*.pyc
+
+# Environment variables
+.env
+.env.local
+.env.development
+.env.production
+.env.test
+
+# Django Migrations
+**/migrations/*.py
+!**/migrations/__init__.py
+
+# Cache & Debug
+*.swp
+*.swo
+*.swn
+*.swd
+*.swm
+*.sws
+*.swt
+*.orig
+*.rej
+*.bak
+
+# AWS & Cloud
+.aws/
+terraform.tfstate
+.terraform/
+*.pem
+
+# Docker
+docker-compose.override.yml
+
+# Git
+.git/
+*.orig
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# PyCharm & VSCode
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Coverage
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+
+# Build files
+*.egg-info/
+*.eggs/
+dist/
+build/
