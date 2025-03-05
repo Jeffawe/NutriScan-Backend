@@ -1,4 +1,6 @@
 from warnings import catch_warnings
+import json
+from datetime import timedelta
 
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -13,6 +15,13 @@ from gradio_client import Client, handle_file
 import spacy
 import tempfile
 from django.core.files.uploadedfile import InMemoryUploadedFile
+import redis
+from django.conf import settings
+
+# Initialize Redis connection
+redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379/0')
+redis_client = redis.from_url(redis_url)
+CACHE_TTL = 60 * 60 * 24  # Cache for 24 hours
 
 nlp = spacy.load("en_core_web_sm")
 
@@ -22,18 +31,29 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # Load .env from the same directory
 load_dotenv(os.path.join(BASE_DIR, '.env'))
 
+
 def home(request):
     return render(request, 'home.html')
+
 
 # Create your views here.
 class FoodProductView(APIView):
     def get(self, request):
-        #Get Product Name from React request
+        # Get Product Name from React request
         product_id = request.query_params.get('fcID')
 
         if not product_id:
-            return Response({"error": "Missing 'name' parameter"}, status=400)
+            return Response({"error": "Missing 'fcID' parameter"}, status=400)
 
+        # Check if result is in Redis cache
+        cache_key = f"food_product:{product_id}"
+        cached_result = redis_client.get(cache_key)
+
+        if cached_result:
+            # Return cached result if available
+            return Response(json.loads(cached_result))
+
+        # If not in cache, fetch from API
         api_key = os.getenv('USDA_API_KEY')
 
         headers = {
@@ -50,6 +70,14 @@ class FoodProductView(APIView):
         food_data = response.json()
 
         processed_data = self.process_food_data(food_data=food_data)
+
+        # Cache the result in Redis
+        redis_client.setex(
+            cache_key,
+            CACHE_TTL,
+            json.dumps(processed_data)
+        )
+
         return Response(processed_data)
 
     @staticmethod
@@ -305,14 +333,23 @@ class FoodProductView(APIView):
             'analysis': analysis
         }
 
+
 class FoodProductViewMany(APIView):
     def get(self, request):
-        #Get Product Name from React request
+        # Get Product Name from React request
         product_name = request.query_params.get('name')
         page_number = int(request.query_params.get('page', 1))
 
         if not product_name:
             return Response({"error": "Missing 'name' parameter"}, status=400)
+
+        # Check if result is in Redis cache
+        cache_key = f"food_search:{product_name}:page:{page_number}"
+        cached_result = redis_client.get(cache_key)
+
+        if cached_result:
+            # Return cached result if available
+            return Response(json.loads(cached_result))
 
         api_key = os.getenv('USDA_API_KEY')
 
@@ -342,7 +379,15 @@ class FoodProductViewMany(APIView):
             processed_data = FoodProductView.process_food_data(food_data=data)
             result["data"].append(processed_data)
 
+        # Cache the result in Redis
+        redis_client.setex(
+            cache_key,
+            CACHE_TTL,
+            json.dumps(result)
+        )
+
         return Response(result)
+
 
 class FoodImageAnalysisView(APIView):
     parser_classes = (MultiPartParser, FormParser)
@@ -354,6 +399,19 @@ class FoodImageAnalysisView(APIView):
         image_file = request.FILES['image']
         use_OCR = request.data.get("use_OCR", "false")
         use_OCR = str(use_OCR).lower() in ["true", "1"]
+
+        # Generate a cache key from the image content
+        image_data = image_file.read()
+        image_hash = hash(image_data)
+        cache_key = f"food_image:{image_hash}:ocr:{use_OCR}"
+
+        # Check cache
+        cached_result = redis_client.get(cache_key)
+        if cached_result:
+            return Response(json.loads(cached_result))
+
+        # Reset file pointer for further processing
+        image_file.seek(0)
 
         # Save the uploaded file temporarily
         with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as temp_file:
@@ -369,6 +427,14 @@ class FoodImageAnalysisView(APIView):
                 return Response({'error': 'No food name detected from image'}, status=400)
 
             food_details_response = self.get_food_details(processed_results)
+
+            # Cache the result
+            redis_client.setex(
+                cache_key,
+                CACHE_TTL * 2,  # Cache image results longer (48 hours)
+                json.dumps(food_details_response)
+            )
+
             return Response(food_details_response)
         finally:
             # Clean up the temporary file
@@ -461,11 +527,19 @@ class FoodImageAnalysisView(APIView):
 
         return other_nouns
 
-
     def get_food_details(self, product_name):
         """Calls FoodProductViewMany to fetch food details."""
         if not product_name:
             return {'error': 'No valid product name found'}
+
+        # We can reuse the cache from FoodProductViewMany if it exists
+        cache_key = f"food_search:{product_name}:page:{1}"
+        cached_result = redis_client.get(cache_key)
+
+        if cached_result:
+            result = json.loads(cached_result)
+            result["searchTerm"] = product_name  # Add search term to the cached result
+            return result
 
         api_key = os.getenv('USDA_API_KEY')
 
@@ -477,7 +551,7 @@ class FoodImageAnalysisView(APIView):
         params = {
             'query': product_name,
             'pageSize': 25,
-            'pageNumber': 2,
+            'pageNumber': 1,
             'dataType': 'Foundation, Branded',
             'sortBy': 'publishedDate',
             'sortOrder': 'asc',
@@ -496,4 +570,29 @@ class FoodImageAnalysisView(APIView):
             processed_data = FoodProductView.process_food_data(food_data=data)
             result['data'].append(processed_data)
 
+        # Cache this result too
+        redis_client.setex(
+            cache_key,
+            CACHE_TTL,
+            json.dumps(result)
+        )
+
         return result
+
+
+# Add a health check endpoint for Redis
+class HealthCheckView(APIView):
+    def get(self, request):
+        status = {
+            "status": "healthy",
+            "redis": "connected"
+        }
+
+        # Check Redis connection
+        try:
+            redis_client.ping()
+        except redis.ConnectionError:
+            status["status"] = "degraded"
+            status["redis"] = "disconnected"
+
+        return Response(status)
