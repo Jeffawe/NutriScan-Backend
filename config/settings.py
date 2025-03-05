@@ -19,23 +19,6 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/5.1/howto/deployment/checklist/
 
-# SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-&*nh39t4#k-=y8_1inimbuprv-@8=3tw98ti73h$ry*l_cn%d+'
-
-# SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
-
-ALLOWED_HOSTS = [
-    "http://localhost:5174",
-    "localhost",
-    '127.0.0.1',
-    "localhost:5174"
-]
-
-CORS_ALLOWED_ORIGINS = [
-    "http://localhost:5174",
-    "http://localhost:5173",
-]
 
 # Application definition
 
