@@ -1,3 +1,5 @@
+from warnings import catch_warnings
+
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.parsers import MultiPartParser, FormParser
@@ -7,6 +9,12 @@ import io
 from dotenv import load_dotenv
 import os
 from django.shortcuts import render
+from gradio_client import Client, handle_file
+import spacy
+import tempfile
+from django.core.files.uploadedfile import InMemoryUploadedFile
+
+nlp = spacy.load("en_core_web_sm")
 
 # Get the directory of the current script
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -20,7 +28,7 @@ def home(request):
 # Create your views here.
 class FoodProductView(APIView):
     def get(self, request):
-        #Get Product Name from react request
+        #Get Product Name from React request
         product_id = request.query_params.get('fcID')
 
         if not product_id:
@@ -299,11 +307,165 @@ class FoodProductView(APIView):
 
 class FoodProductViewMany(APIView):
     def get(self, request):
-        #Get Product Name from react request
+        #Get Product Name from React request
         product_name = request.query_params.get('name')
+        page_number = int(request.query_params.get('page', 1))
 
         if not product_name:
             return Response({"error": "Missing 'name' parameter"}, status=400)
+
+        api_key = os.getenv('USDA_API_KEY')
+
+        headers = {
+            'accept': 'application/json',
+        }
+
+        usda_api_url = 'https://api.nal.usda.gov/fdc/v1/foods/search'
+        params = {
+            'query': product_name,
+            'pageSize': 25,
+            'pageNumber': page_number,
+            'dataType': 'Foundation, Branded',
+            'sortBy': 'publishedDate',
+            'sortOrder': 'asc',
+            'api_key': api_key
+        }
+
+        response = requests.get(usda_api_url, headers=headers, params=params)
+        food_data = response.json()
+        result = {
+            "totalPages": food_data.get('totalPages', 0),
+            "data": []
+        }
+
+        for data in food_data['foods']:
+            processed_data = FoodProductView.process_food_data(food_data=data)
+            result["data"].append(processed_data)
+
+        return Response(result)
+
+class FoodImageAnalysisView(APIView):
+    parser_classes = (MultiPartParser, FormParser)
+
+    def post(self, request):
+        if 'image' not in request.FILES:
+            return Response({'error': 'No image provided'}, status=400)
+
+        image_file = request.FILES['image']
+        use_OCR = request.data.get("use_OCR", "false")
+        use_OCR = str(use_OCR).lower() in ["true", "1"]
+
+        # Save the uploaded file temporarily
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as temp_file:
+            for chunk in image_file.chunks():
+                temp_file.write(chunk)
+            temp_file_path = temp_file.name
+
+        try:
+            # Process the image using the saved file path
+            processed_results = self.process_image(temp_file_path, use_OCR)
+
+            if not processed_results:
+                return Response({'error': 'No food name detected from image'}, status=400)
+
+            food_details_response = self.get_food_details(processed_results)
+            return Response(food_details_response)
+        finally:
+            # Clean up the temporary file
+            if os.path.exists(temp_file_path):
+                os.unlink(temp_file_path)
+
+    def process_image(self, image, use_OCR):
+        # Example image processing
+        client = Client("Jeffawe/Food_Scanner")
+        result = client.predict(
+            image=handle_file(image),
+            use_ocr=use_OCR,
+            api_name="/recognize_image"
+        )
+        print(result)
+        final_result = " ".join(self.extract_product_name(result))
+        print(final_result)
+        # Placeholder return
+        return final_result
+
+    def extract_product_name(self, text):
+        if not text:
+            return []
+
+        doc = nlp(text)
+
+        # 1. Look for brand names (usually in ALL CAPS or Title Case)
+        brands = []
+        for token in doc:
+            if token.text.isupper() or (token.text.istitle() and len(token.text) > 2):
+                # Check if part of a multi-token brand name
+                if token.i < len(doc) - 1 and doc[token.i + 1].text.istitle():
+                    brands.append(token.text + " " + doc[token.i + 1].text)
+                else:
+                    brands.append(token.text)
+
+        # 2. Extract named entities labeled as PRODUCT or ORG
+        product_ents = [ent.text for ent in doc.ents if ent.label_ in ["PRODUCT", "ORG"]]
+
+        # 3. Look for "X of Y" patterns where Y is the product
+        of_products = []
+        for token in doc:
+            if token.dep_ == "pobj" and token.head.text.lower() == "of":
+                # Get the entire phrase starting from this token
+                start_idx = token.i
+                end_idx = start_idx + 1
+
+                # Extend to include adjectives and compound nouns
+                while end_idx < len(doc) and (doc[end_idx].dep_ in ["compound", "amod", "nummod"]
+                                              or doc[end_idx].pos_ == "NOUN"):
+                    end_idx += 1
+
+                product_phrase = doc[start_idx:end_idx].text
+
+                # If we have adjectives before the object
+                prev_idx = token.i - 1
+                while prev_idx >= 0 and doc[prev_idx].dep_ in ["amod", "compound"] and doc[prev_idx].head == token:
+                    product_phrase = doc[prev_idx].text + " " + product_phrase
+                    prev_idx -= 1
+
+                of_products.append(product_phrase)
+
+        # 4. Extract noun chunks as fallback, prioritizing food items
+        container_words = ["bottle", "box", "can", "jar", "package", "container", "bag"]
+        food_nouns = []
+        other_nouns = []
+
+        for chunk in doc.noun_chunks:
+            # Filter out determiners and clean up the chunk
+            clean_chunk = " ".join([t.text for t in chunk if t.pos_ != "DET"])
+
+            if clean_chunk and len(clean_chunk.split()) <= 4:  # Reasonable length
+                if any(container in clean_chunk.lower() for container in container_words):
+                    other_nouns.append(clean_chunk)
+                else:
+                    food_nouns.append(clean_chunk)
+
+        # Prioritize results
+        if brands:
+            # If we found brands, return them along with any "of" products
+            if of_products:
+                return brands + of_products
+            return brands
+
+        if of_products:
+            return of_products
+
+        if food_nouns:
+            return food_nouns
+
+        return other_nouns
+
+
+    def get_food_details(self, product_name):
+        """Calls FoodProductViewMany to fetch food details."""
+        if not product_name:
+            return {'error': 'No valid product name found'}
 
         api_key = os.getenv('USDA_API_KEY')
 
@@ -324,41 +486,14 @@ class FoodProductViewMany(APIView):
 
         response = requests.get(usda_api_url, headers=headers, params=params)
         food_data = response.json()
-        result = []
-
-        for data in food_data['foods']:
-            processed_data = FoodProductView.process_food_data(food_data=data)
-            result.append(processed_data)
-
-        return Response(result)
-
-class FoodImageAnalysisView(APIView):
-    parser_classes = (MultiPartParser, FormParser)
-
-    def post(self, request):
-        if 'image' not in request.FILES:
-            return Response({'error': 'No image provided'}, status=400)
-
-        image_file = request.FILES['image']
-
-        # Convert uploaded file to PIL Image
-        image = Image.open(io.BytesIO(image_file.read()))
-
-        # Do image processing here
-        processed_results = self.process_image(image)
-
-        return Response(processed_results)
-
-    def process_image(self, image):
-        # Example image processing
-        # You could:
-        # 1. Use OCR to read text
-        # 2. Use computer vision to detect food type
-        # 3. Analyze packaging information
-
-        # Placeholder return
-        return {
-            'detected_text': 'Sample text from image',
-            'food_type': 'Detected food type',
-            'packaging_info': 'Detected packaging information'
+        result = {
+            "totalPages": food_data.get('totalPages', 0),
+            "searchTerm": product_name,
+            "data": []
         }
+
+        for data in food_data.get('foods', []):
+            processed_data = FoodProductView.process_food_data(food_data=data)
+            result['data'].append(processed_data)
+
+        return result
