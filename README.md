@@ -1,1 +1,1 @@
-# NutriScan-Backend
+# ScanMyFood-Backend
