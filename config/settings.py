@@ -11,17 +11,24 @@ https://docs.djangoproject.com/en/5.1/ref/settings/
 """
 
 from pathlib import Path
+import os
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
+
 ALLOWED_HOSTS = [
+    "localhost",
+    "127.0.0.1",
     "nutriscan-backend-i822.onrender.com"  # Add this line
 ]
 
 CORS_ALLOWED_ORIGINS = [
-    "http://localhost:5174",
-    "http://localhost:5173",
+    "https://scanmyfood.vercel.app",
+]
+
+CSRF_TRUSTED_ORIGINS = [
+    "https://nutriscan-backend-i822.onrender.com"
 ]
 
 # Application definition
@@ -46,6 +53,27 @@ MIDDLEWARE = [
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
+
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'handlers': {
+        'console': {
+            'class': 'logging.StreamHandler',
+        },
+    },
+    'root': {
+        'handlers': ['console'],
+        'level': 'WARNING',
+    },
+    'loggers': {
+        'django': {
+            'handlers': ['console'],
+            'level': os.getenv('DJANGO_LOG_LEVEL', 'ERROR'),
+            'propagate': False,
+        },
+    },
+}
 
 ROOT_URLCONF = 'config.urls'
 
