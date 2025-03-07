@@ -16,11 +16,12 @@ Including another URLconf
 """
 from django.contrib import admin
 from django.urls import path
-from api.views import FoodProductView, FoodProductViewMany, FoodImageAnalysisView, home
+from api.views import FoodProductView, FoodProductViewMany, FoodImageAnalysisView, home, HealthCheckView
 
 urlpatterns = [
     path('admin/', admin.site.urls),
-    path('', home, name='home'),  # Default homepage
+    path('', home, name='home'),
+    path('health/', HealthCheckView.as_view()),
     path('analyze-food/', FoodProductView.as_view()),
     path('analyze-many-food/', FoodProductViewMany.as_view()),
     path('analyze-image/', FoodImageAnalysisView.as_view()),
