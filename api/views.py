@@ -11,6 +11,13 @@ import spacy
 import tempfile
 import redis
 from google import genai
+from django.http import JsonResponse
+
+# Get the directory of the current script
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Load .env from the same directory
+load_dotenv(os.path.join(BASE_DIR, '.env'))
 
 # Initialize Redis connection
 redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379/0')
@@ -19,16 +26,89 @@ CACHE_TTL = 60 * 60 * 24  # Cache for 24 hours
 
 nlp = spacy.load("en_core_web_sm")
 
-# Get the directory of the current script
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# Load .env from the same directory
-load_dotenv(os.path.join(BASE_DIR, '.env'))
+Max_Requests = int(os.getenv('MAX_REQUESTS', 30))
+Max_LLM_Requests = int(os.getenv('MAX_LLM_REQUESTS', 10))
 
 
 def home(request):
     return render(request, 'home.html')
 
+
+class RateLimiter:
+    """
+    Comprehensive rate limiting class to manage different types of request limits
+    """
+
+    @staticmethod
+    def get_client_ip(request):
+        """
+        Extract client IP address from request
+        """
+        x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
+        if x_forwarded_for:
+            ip = x_forwarded_for.split(',')[0]
+        else:
+            ip = request.META.get('REMOTE_ADDR')
+        return ip
+
+    @staticmethod
+    def should_use_bert(request):
+        """
+        Determine if BERT model should be used based on request count
+
+        Returns:
+            tuple: (use_bert, can_continue)
+                - use_bert: Whether to switch to BERT model
+                - can_continue: Whether to allow the request
+        """
+        # Get client IP
+        ip = RateLimiter.get_client_ip(request)
+
+        # Create unique key for this IP and endpoint
+        rate_limit_key = f"rate_limit:{ip}:food_image_analysis"
+
+        # Increment request count and get current count
+        request_count = redis_client.incr(rate_limit_key)
+
+        # Set expiration if this is the first request
+        if request_count == 1:
+            redis_client.expire(rate_limit_key, 3600)  # 1-hour window
+
+        # Check thresholds
+        if request_count > Max_Requests:
+            # Too many requests - block
+            return False, False
+
+        # Switch to BERT after 10 requests
+        return request_count > Max_LLM_Requests, True
+
+
+class GlobalAPIUsageMiddleware:
+    """
+    Middleware to track and limit overall API usage across the application
+    """
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+        self.TOTAL_MONTHLY_API_LIMIT = int(os.getenv('MONTHLY_API_LIMIT', 5000000))  # Total monthly API calls
+        self.API_USAGE_KEY = "global_api_usage:current_month"
+        if not redis_client.exists(self.API_USAGE_KEY):
+            redis_client.set(self.API_USAGE_KEY, 0, ex=2592000)
+
+    def __call__(self, request):
+        # Check global API usage before processing request
+        current_usage = int(redis_client.get(self.API_USAGE_KEY) or 0)
+
+        if current_usage >= self.TOTAL_MONTHLY_API_LIMIT:
+            # Set a custom attribute on the request
+            request.api_limit_exceeded = True
+        else:
+            # Increment global API usage
+            redis_client.incr(self.API_USAGE_KEY)
+            request.api_limit_exceeded = False
+
+        response = self.get_response(request)
+        return response
 
 # Create your views here.
 class FoodProductView(APIView):
@@ -484,6 +564,18 @@ class FoodImageAnalysisView(APIView):
         if 'image' not in request.FILES:
             return Response({'error': 'No image provided'}, status=400)
 
+        use_bert, can_continue = RateLimiter.should_use_bert(request)
+
+        if getattr(request, 'api_limit_exceeded', False):
+            use_bert = True
+
+        if not can_continue:
+            return Response({
+                'error': 'Rate limit exceeded',
+                'message': 'Too many requests. Try again in 1 hour.',
+                'retry_after': 3600
+            }, status=429)
+
         image_file = request.FILES['image']
         use_OCR = request.data.get("use_OCR", "false")
         use_OCR = str(use_OCR).lower() in ["true", "1"]
@@ -508,22 +600,25 @@ class FoodImageAnalysisView(APIView):
             temp_file_path = temp_file.name
 
         try:
-            gemini_result = self.gemini_analyzer.analyze_image(
-                temp_file_path,
-                use_ocr=use_OCR
-            )
+            if not use_bert:
+                gemini_result = self.gemini_analyzer.analyze_image(
+                    temp_file_path,
+                    use_ocr=use_OCR
+                )
 
-            if gemini_result:
-                # Use Gemini result to search
-                processed_results = gemini_result
+                if gemini_result:
+                    # Use Gemini result to search
+                    processed_results = gemini_result
+                else:
+                    # Fallback to existing BERT model
+                    processed_results = self.process_image(temp_file_path, use_OCR)
             else:
-                # Fallback to existing BERT model
                 processed_results = self.process_image(temp_file_path, use_OCR)
 
             if not processed_results:
                 return Response({'error': 'No food name detected from image'}, status=400)
 
-            food_details_response = self.get_food_details(processed_results)
+            food_details_response = self.get_food_details(processed_results, not use_bert)
 
             # Cache the result
             redis_client.setex(
@@ -624,7 +719,7 @@ class FoodImageAnalysisView(APIView):
 
         return other_nouns
 
-    def get_food_details(self, product_name):
+    def get_food_details(self, product_name, use_llm):
         """Calls FoodProductViewMany to fetch food details."""
         if not product_name:
             return {'error': 'No valid product name found'}
@@ -660,7 +755,8 @@ class FoodImageAnalysisView(APIView):
         result = {
             "totalPages": food_data.get('totalPages', 0),
             "searchTerm": product_name,
-            "data": []
+            "data": [],
+            "use_llm": use_llm
         }
 
         for data in food_data.get('foods', []):
