@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 # Path to the directory containing views.py and .env
-APP_DIR = os.path.join(BASE_DIR, 'app')  # Adjust 'app' to your app's name
+APP_DIR = os.path.join(BASE_DIR, 'api')  # Adjust 'app' to your app's name
 
 # Load .env from the app directory
 load_dotenv(os.path.join(APP_DIR, '.env'))
@@ -35,11 +35,12 @@ DEBUG = os.environ.get('DEBUG')
 ALLOWED_HOSTS = [
     "localhost",
     "127.0.0.1",
-    "nutriscan-backend-i822.onrender.com"  # Add this line
+    "nutriscan-backend-i822.onrender.com"
 ]
 
 CORS_ALLOWED_ORIGINS = [
     "https://scanmyfood.vercel.app",
+    "http://localhost:5173"
 ]
 
 CSRF_TRUSTED_ORIGINS = [

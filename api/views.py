@@ -1,22 +1,16 @@
-from warnings import catch_warnings
 import json
-from datetime import timedelta
-
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.parsers import MultiPartParser, FormParser
 import requests
-from PIL import Image
-import io
 from dotenv import load_dotenv
 import os
 from django.shortcuts import render
 from gradio_client import Client, handle_file
 import spacy
 import tempfile
-from django.core.files.uploadedfile import InMemoryUploadedFile
 import redis
-from django.conf import settings
+from google import genai
 
 # Initialize Redis connection
 redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379/0')
@@ -389,8 +383,102 @@ class FoodProductViewMany(APIView):
         return Response(result)
 
 
+class GeminiImageAnalyzer:
+    def __init__(self):
+        # Initialize Redis for tracking API usage
+        self.redis_client = redis.from_url(redis_url)
+
+        # Set up Gemini API key and configuration
+        self.gemini_api_key = os.getenv('GEMINI_API_KEY')
+        self.client = genai.Client(api_key=self.gemini_api_key)
+
+        # Configuration for tracking API usage
+        self.MONTHLY_API_LIMIT = 1000000  # Example monthly limit in tokens/characters
+        self.USAGE_WARN_THRESHOLD = 0.2  # 20% remaining
+
+    def track_api_usage(self, tokens_used):
+        """
+        Track Gemini API usage and check against monthly limit
+
+        Args:
+            tokens_used (int): Number of tokens/characters used in this request
+
+        Returns:
+            bool: True if usage is within limits, False otherwise
+        """
+        current_usage_key = "gemini_api_usage:current_month"
+
+        try:
+            # Get current month's usage
+            current_usage = int(self.redis_client.get(current_usage_key) or 0)
+            new_usage = current_usage + tokens_used
+
+            # Check if usage exceeds limit
+            if new_usage > self.MONTHLY_API_LIMIT * (1 - self.USAGE_WARN_THRESHOLD):
+                return False
+
+            # Update usage
+            self.redis_client.set(current_usage_key, new_usage)
+            return True
+        except redis.exceptions.ConnectionError as e:
+            print(f"Redis connection error: {e}")
+            return False
+
+    def analyze_image(self, image_path, use_ocr=False):
+        """
+        Analyze image using Gemini API with fallback and usage tracking
+
+        Args:
+            image_path (str): Path to the image file
+            use_ocr (bool): Whether to enable OCR-like text extraction
+
+        Returns:
+            str: Detected product name or description
+        """
+        try:
+            # Upload the file
+            uploaded_file = self.client.files.upload(file=image_path)
+
+            # Prepare prompt
+            prompt = ("Identify the food or product in this image. "
+                          "Return only the product name or type. "
+                          "If it's a branded product, include the brand. "
+                          "Be concise and specific.")
+
+            # Additional OCR-like text extraction if requested
+            if use_ocr:
+                prompt += " If there are any readable texts in the image, include them."
+
+            # Generate response
+            result = self.client.models.generate_content(
+                model="gemini-2.0-flash",
+                contents=[
+                    uploaded_file,
+                    "\n\n",
+                    prompt
+                ]
+            )
+
+            tokens_used = len(result.text.split())
+
+            # Check API usage
+            if not self.track_api_usage(tokens_used):
+                # Fallback to existing method if near usage limit
+                return None
+
+            print(result.text.strip())
+            return result.text.strip()
+
+        except Exception as e:
+            # Log the error, fallback to existing method
+            print(f"Gemini API error: {e}")
+            return None
+
 class FoodImageAnalysisView(APIView):
     parser_classes = (MultiPartParser, FormParser)
+    def __init__(self, *args, **kwargs):
+        super().__init__(**kwargs)
+        self.gemini_analyzer = GeminiImageAnalyzer()
 
     def post(self, request):
         if 'image' not in request.FILES:
@@ -420,8 +508,17 @@ class FoodImageAnalysisView(APIView):
             temp_file_path = temp_file.name
 
         try:
-            # Process the image using the saved file path
-            processed_results = self.process_image(temp_file_path, use_OCR)
+            gemini_result = self.gemini_analyzer.analyze_image(
+                temp_file_path,
+                use_ocr=use_OCR
+            )
+
+            if gemini_result:
+                # Use Gemini result to search
+                processed_results = gemini_result
+            else:
+                # Fallback to existing BERT model
+                processed_results = self.process_image(temp_file_path, use_OCR)
 
             if not processed_results:
                 return Response({'error': 'No food name detected from image'}, status=400)
