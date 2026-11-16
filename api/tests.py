@@ -330,3 +330,22 @@ class GeminiModelNotFoundTests(GeminiQuotaTests):
         self.analyzer.client.models.generate_content.side_effect = error
         self.assertIsNone(self.analyzer.analyze_image(b'x'))
         self.assertEqual(self.analyzer.status()['status'], 'model_not_found')
+
+
+class GeminiFallbackTests(GeminiQuotaTests):
+    def test_overloaded_main_model_falls_back(self):
+        overloaded = Exception('503 UNAVAILABLE. This model is currently experiencing high demand.')
+        overloaded.code = 503
+        self.analyzer.client.models.generate_content.side_effect = [overloaded, mock.Mock(text='nutella')]
+        self.assertEqual(self.analyzer.analyze_image(b'x'), 'nutella')
+        models_tried = [c.kwargs['model'] for c in self.analyzer.client.models.generate_content.call_args_list]
+        self.assertEqual(models_tried, [views.GEMINI_MODEL, views.GEMINI_FALLBACK_MODEL])
+        self.assertEqual(self.analyzer.usage()['used_today'], 2)  # both attempts counted
+        self.assertEqual(self.analyzer.status()['status'], 'ok_fallback')
+
+    def test_quota_error_does_not_fall_back(self):
+        quota = Exception('429 RESOURCE_EXHAUSTED: quota exceeded')
+        quota.code = 429
+        self.analyzer.client.models.generate_content.side_effect = quota
+        self.assertIsNone(self.analyzer.analyze_image(b'x'))
+        self.assertEqual(self.analyzer.client.models.generate_content.call_count, 1)

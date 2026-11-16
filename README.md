@@ -25,6 +25,7 @@ Django REST API behind [ScanMyFood](https://scanmyfood.vercel.app). It looks up 
 | `USDA_API_KEY` | yes | | Free from https://fdc.nal.usda.gov/api-key-signup |
 | `GEMINI_API_KEY` | for photo scanning | | Free-tier key from https://aistudio.google.com/apikey. Without a billing account it can't incur charges. |
 | `GEMINI_MODEL` | | `gemini-3.8-flash` | gemini-2.5-flash is no longer available to new API users |
+| `GEMINI_FALLBACK_MODEL` | | `gemini-3.5-flash-lite` | Tried once if the main model is overloaded or unavailable; counts against the same budget |
 | `GEMINI_FREE_RPM` | | `5` | Your project's free-tier requests per minute (AI Studio → Rate limits) |
 | `GEMINI_FREE_RPD` | | `20` | Your project's free-tier requests per day (resets at midnight Pacific) |
 | `GEMINI_QUOTA_SHARE` | | `0.5` | Share of each limit the app may use (0.5 = half) |

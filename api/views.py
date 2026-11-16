@@ -44,6 +44,8 @@ PACIFIC = ZoneInfo('America/Los_Angeles')
 MAX_BARCODE_REQUESTS = int(os.getenv('MAX_BARCODE_REQUESTS', 120))  # per IP per hour
 
 GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-3.8-flash')  # 2.5-flash is closed to new users
+# Tried once when the main model is overloaded (5xx) or unavailable (404). Empty to disable.
+GEMINI_FALLBACK_MODEL = os.getenv('GEMINI_FALLBACK_MODEL', 'gemini-3.5-flash-lite')
 GEMINI_TIMEOUT_MS = int(os.getenv('GEMINI_TIMEOUT_MS', 20000))
 MAX_IMAGE_BYTES = int(os.getenv('MAX_IMAGE_BYTES', 10 * 1024 * 1024))  # 10 MB
 # Number of public proxies in front of the app that append to X-Forwarded-For (Render: 1)
@@ -450,48 +452,64 @@ class GeminiImageAnalyzer:
 
     # ---- recognition ------------------------------------------------------------------
 
+    @staticmethod
+    def _is_retryable(error):
+        """Model overloaded (5xx) or not available (404): worth trying the fallback model."""
+        code = getattr(error, 'code', None)
+        lower = str(error).lower()
+        return code in (404, 500, 502, 503, 504) or 'unavailable' in lower or 'overloaded' in lower
+
     def analyze_image(self, image_bytes, mime_type='image/jpeg', use_ocr=False):
         """
         Returns the detected food/product name, or None if Gemini is unavailable right now
         (not configured, over the app's quota share, cooling down after a 429, or an error).
+        If the main model is overloaded or missing, tries GEMINI_FALLBACK_MODEL once.
         """
         if self.client is None:
             return None
-        try:
-            if not self._reserve():
-                return None
-        except redis.exceptions.RedisError as e:
-            # Without Redis we can't count usage, so don't risk the shared quota
-            print(f"Redis error, skipping Gemini: {e}")
-            return None
 
-        try:
-            # Send the image inline instead of uploading it to the Files API
-            image_part = genai_types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
+        # Send the image inline instead of uploading it to the Files API
+        image_part = genai_types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
+        prompt = ("Identify the food or product in this image. "
+                  "Return only the product name or type, in a few words suitable for "
+                  "searching a nutrition database. "
+                  "If it's a branded product, include the brand. "
+                  "Be concise and specific. Do not add any other text.")
+        if use_ocr:
+            prompt += " If there are any readable texts in the image, include them."
 
-            prompt = ("Identify the food or product in this image. "
-                      "Return only the product name or type, in a few words suitable for "
-                      "searching a nutrition database. "
-                      "If it's a branded product, include the brand. "
-                      "Be concise and specific. Do not add any other text.")
-            if use_ocr:
-                prompt += " If there are any readable texts in the image, include them."
-
-            result = self.client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=[image_part, "\n\n", prompt]
-            )
-            text = (result.text or '').strip()
-            self._set_status("ok")
-            print(f"Gemini identified: {text}")
-            return text or None
-
-        except Exception as e:
+        models = [GEMINI_MODEL] + ([GEMINI_FALLBACK_MODEL] if GEMINI_FALLBACK_MODEL
+                                   and GEMINI_FALLBACK_MODEL != GEMINI_MODEL else [])
+        for attempt, model in enumerate(models):
             try:
-                self._handle_error(e)
-            except redis.exceptions.RedisError:
-                print(f"Gemini API error: {e}")
-            return None
+                # Every attempt counts against the app's share of the free tier
+                if not self._reserve():
+                    return None
+            except redis.exceptions.RedisError as e:
+                # Without Redis we can't count usage, so don't risk the shared quota
+                print(f"Redis error, skipping Gemini: {e}")
+                return None
+
+            try:
+                result = self.client.models.generate_content(
+                    model=model,
+                    contents=[image_part, "\n\n", prompt]
+                )
+                text = (result.text or '').strip()
+                self._set_status("ok" if attempt == 0 else "ok_fallback")
+                print(f"Gemini ({model}) identified: {text}")
+                return text or None
+
+            except Exception as e:
+                if attempt < len(models) - 1 and self._is_retryable(e):
+                    print(f"Gemini ({model}) unavailable, trying fallback: {e}")
+                    continue
+                try:
+                    self._handle_error(e)
+                except redis.exceptions.RedisError:
+                    print(f"Gemini API error: {e}")
+                return None
+        return None
 
 
 class FoodImageAnalysisView(APIView):
