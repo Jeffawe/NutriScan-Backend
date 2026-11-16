@@ -190,7 +190,7 @@ def search_foods(query, page_number=1):
     """
     Text search across both databases, run in parallel:
     - USDA (US branded + generic reference foods), paginated
-    - Open Food Facts (worldwide products), first page only, shown first since they're exact brand/name hits
+    - Open Food Facts (worldwide products), first page only; listed before USDA only when USDA had no exact match
     If one source fails, results from the other are still returned. Raises USDAError only if
     USDA fails and Open Food Facts found nothing.
     """
@@ -214,7 +214,12 @@ def search_foods(query, page_number=1):
                       "notice": "Only showing Open Food Facts results right now (USDA is unavailable)."}
 
     if off_results:
-        result["data"] = off_results + result["data"]
+        # USDA exact match (e.g. "peanut butter") -> USDA's entries first, worldwide products after.
+        # No USDA match (e.g. a non-US brand like "ambrosia peanut butter") -> Open Food Facts first.
+        if result.get("exactMatch"):
+            result["data"] = result["data"] + off_results
+        else:
+            result["data"] = off_results + result["data"]
     elif not result.get("exactMatch") and result.get("data"):
         result["notice"] = (f'No exact match for "{query.strip()}". Showing the closest results instead. '
                             "Scanning the barcode is the most reliable way to find a specific product.")

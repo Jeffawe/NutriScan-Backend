@@ -425,3 +425,12 @@ class SearchFoodsTests(SimpleTestCase):
         with mock.patch('api.openfoodfacts.requests.get', return_value=fake_response(hits)):
             names = [r['basic_info']['name'] for r in search_products('ambrosia peanut butter')]
         self.assertEqual(names, ['Ambrosia Organic Peanut Butter'])
+
+
+class SearchOrderTests(SearchFoodsTests):
+    def test_usda_exact_match_stays_first(self):
+        exact = {'totalPages': 1, 'foods': [{'description': 'Peanut butter', 'dataType': 'SR Legacy', 'foodNutrients': []}]}
+        off = [process_off_product(dict(OpenFoodFactsTests.PRODUCT, product_name='Peanut Butter & Co'))]
+        with self.usda(exact), mock.patch.object(views, 'search_off_cached', return_value=off):
+            names = [f['basic_info']['name'] for f in views.search_foods('peanut butter')['data']]
+        self.assertEqual(names, ['Peanut butter', 'Peanut Butter & Co'])
