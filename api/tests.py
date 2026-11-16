@@ -321,3 +321,12 @@ class UsdaBusyTests(SimpleTestCase):
         self.assertEqual(first['Retry-After'], '60')
         self.assertEqual(second.status_code, 503)
         usda.assert_called_once()  # second request didn't hit USDA during the cool-down
+
+
+class GeminiModelNotFoundTests(GeminiQuotaTests):
+    def test_404_reports_model_not_found(self):
+        error = Exception("404 NOT_FOUND. This model models/gemini-2.5-flash is no longer available")
+        error.code = 404
+        self.analyzer.client.models.generate_content.side_effect = error
+        self.assertIsNone(self.analyzer.analyze_image(b'x'))
+        self.assertEqual(self.analyzer.status()['status'], 'model_not_found')

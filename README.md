@@ -24,7 +24,7 @@ Django REST API behind [ScanMyFood](https://scanmyfood.vercel.app). It looks up 
 | `REDIS_URL` | yes | `redis://localhost:6379/0` | Caching and rate limits |
 | `USDA_API_KEY` | yes | | Free from https://fdc.nal.usda.gov/api-key-signup |
 | `GEMINI_API_KEY` | for photo scanning | | Free-tier key from https://aistudio.google.com/apikey. Without a billing account it can't incur charges. |
-| `GEMINI_MODEL` | | `gemini-2.5-flash` | |
+| `GEMINI_MODEL` | | `gemini-3.8-flash` | gemini-2.5-flash is no longer available to new API users |
 | `GEMINI_FREE_RPM` | | `5` | Your project's free-tier requests per minute (AI Studio → Rate limits) |
 | `GEMINI_FREE_RPD` | | `20` | Your project's free-tier requests per day (resets at midnight Pacific) |
 | `GEMINI_QUOTA_SHARE` | | `0.5` | Share of each limit the app may use (0.5 = half) |

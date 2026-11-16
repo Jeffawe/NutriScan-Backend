@@ -32,7 +32,7 @@ CACHE_TTL = 60 * 60 * 24  # Cache for 24 hours
 
 # ---- Gemini free-tier budget --------------------------------------------------------------
 # Set these to the limits shown for your project at https://aistudio.google.com (Rate limits page).
-# Defaults are the lowest recently reported free-tier limits for gemini-2.5-flash.
+# Defaults are the lowest recently reported free-tier limits (gemini-2.5-flash / 3.8-flash: 5 RPM, 20 RPD).
 GEMINI_FREE_RPM = int(os.getenv('GEMINI_FREE_RPM', 5))    # requests per minute
 GEMINI_FREE_RPD = int(os.getenv('GEMINI_FREE_RPD', 20))   # requests per day (resets midnight Pacific)
 GEMINI_QUOTA_SHARE = float(os.getenv('GEMINI_QUOTA_SHARE', 0.5))  # use at most this share of each limit
@@ -43,7 +43,7 @@ MAX_IMAGE_REQUESTS_PER_IP = int(os.getenv('MAX_IMAGE_REQUESTS_PER_IP', 3))
 PACIFIC = ZoneInfo('America/Los_Angeles')
 MAX_BARCODE_REQUESTS = int(os.getenv('MAX_BARCODE_REQUESTS', 120))  # per IP per hour
 
-GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-2.5-flash')
+GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-3.8-flash')  # 2.5-flash is closed to new users
 GEMINI_TIMEOUT_MS = int(os.getenv('GEMINI_TIMEOUT_MS', 20000))
 MAX_IMAGE_BYTES = int(os.getenv('MAX_IMAGE_BYTES', 10 * 1024 * 1024))  # 10 MB
 # Number of public proxies in front of the app that append to X-Forwarded-For (Render: 1)
@@ -419,7 +419,7 @@ class GeminiImageAnalyzer:
             # An invalid key won't fix itself; don't hammer the API until it's replaced
             self.redis_client.setex("gemini:cooldown", 60 * 10, 1)
             self._set_status("invalid_or_expired_key")
-        elif 'not found' in lower:
+        elif getattr(error, 'code', None) == 404 or 'not found' in lower or 'not_found' in lower:
             self._set_status("model_not_found")
         else:
             self._set_status("error")
