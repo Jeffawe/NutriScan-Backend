@@ -398,6 +398,7 @@ class SearchFoodsTests(SimpleTestCase):
         food = result['data'][0]['basic_info']
         self.assertIsNone(food['brand'])               # generic USDA foods have no brand
         self.assertEqual(food['data_type'], 'Survey (FNDDS)')
+        self.assertEqual((food['serving_size'], food['serving_unit']), (100, 'g'))  # generic = per 100 g
 
     def test_open_food_facts_results_come_first(self):
         off = [process_off_product(dict(OpenFoodFactsTests.PRODUCT, product_name='Ambrosia Organic Peanut Butter'))]

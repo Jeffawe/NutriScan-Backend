@@ -161,6 +161,11 @@ def process_usda_food(food_data):
         'source': 'usda',
         'image_url': None,
     }
+    # Generic USDA foods (Foundation, SR Legacy, FNDDS) always report nutrients per 100 g
+    if basic_info['data_type'] and basic_info['data_type'] != 'Branded' and not basic_info['serving_size']:
+        basic_info['serving_size'] = 100
+        basic_info['serving_unit'] = 'g'
+
     # FoodCategory can be a nested object on the detail endpoint
     if isinstance(basic_info['category'], dict):
         basic_info['category'] = basic_info['category'].get('description')

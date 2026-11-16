@@ -149,7 +149,7 @@ def search_usda(product_name, page_number=1):
     when nothing matches; `exactMatch` tells the caller which one happened.
     """
     normalized = product_name.strip().lower()
-    cache_key = f"food_search:v2:{normalized}:page:{page_number}"
+    cache_key = f"food_search:v3:{normalized}:page:{page_number}"
     cached_result = redis_client.get(cache_key)
     if cached_result:
         return json.loads(cached_result)
