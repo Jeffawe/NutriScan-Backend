@@ -46,7 +46,8 @@ MAX_BARCODE_REQUESTS = int(os.getenv('MAX_BARCODE_REQUESTS', 120))  # per IP per
 GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-3.8-flash')  # 2.5-flash is closed to new users
 # Tried once when the main model is overloaded (5xx) or unavailable (404). Empty to disable.
 GEMINI_FALLBACK_MODEL = os.getenv('GEMINI_FALLBACK_MODEL', 'gemini-3.5-flash-lite')
-GEMINI_TIMEOUT_MS = int(os.getenv('GEMINI_TIMEOUT_MS', 20000))
+# Per attempt. Worst case: 15s main + 15s fallback + 15s USDA = 45s (< gunicorn's 60s timeout)
+GEMINI_TIMEOUT_MS = int(os.getenv('GEMINI_TIMEOUT_MS', 15000))
 MAX_IMAGE_BYTES = int(os.getenv('MAX_IMAGE_BYTES', 10 * 1024 * 1024))  # 10 MB
 # Number of public proxies in front of the app that append to X-Forwarded-For (Render: 1)
 TRUSTED_PROXY_COUNT = max(1, int(os.getenv('TRUSTED_PROXY_COUNT', 1)))
@@ -454,10 +455,11 @@ class GeminiImageAnalyzer:
 
     @staticmethod
     def _is_retryable(error):
-        """Model overloaded (5xx) or not available (404): worth trying the fallback model."""
+        """Model overloaded (5xx / timed out) or not available (404): worth trying the fallback model."""
         code = getattr(error, 'code', None)
         lower = str(error).lower()
-        return code in (404, 500, 502, 503, 504) or 'unavailable' in lower or 'overloaded' in lower
+        return (code in (404, 500, 502, 503, 504) or 'unavailable' in lower or 'overloaded' in lower
+                or 'timed out' in lower or 'timeout' in lower)
 
     def analyze_image(self, image_bytes, mime_type='image/jpeg', use_ocr=False):
         """

@@ -349,3 +349,10 @@ class GeminiFallbackTests(GeminiQuotaTests):
         self.analyzer.client.models.generate_content.side_effect = quota
         self.assertIsNone(self.analyzer.analyze_image(b'x'))
         self.assertEqual(self.analyzer.client.models.generate_content.call_count, 1)
+
+
+class GeminiTimeoutFallbackTests(GeminiQuotaTests):
+    def test_timeout_falls_back(self):
+        self.analyzer.client.models.generate_content.side_effect = [
+            Exception('The read operation timed out'), mock.Mock(text='banana')]
+        self.assertEqual(self.analyzer.analyze_image(b'x'), 'banana')

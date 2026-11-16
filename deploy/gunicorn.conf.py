@@ -12,8 +12,8 @@ worker_class = "gthread"
 workers = int(os.getenv("GUNICORN_WORKERS", 2))
 threads = int(os.getenv("GUNICORN_THREADS", 4))
 
-# Longest legitimate request: USDA (15s) after a Gemini call (20s). Anything slower is killed.
-timeout = 45
+# Longest legitimate request: two Gemini attempts (15s each) + USDA (15s) = 45s. Anything slower is killed.
+timeout = 60
 graceful_timeout = 20
 keepalive = 5
 backlog = 64
