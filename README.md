@@ -46,3 +46,22 @@ python manage.py runserver
 SECRET_KEY=test python manage.py test api
 ```
 The tests mock Redis and all external APIs, so they don't need network access or keys.
+
+## Deployment (Oracle VM)
+Production runs at `https://scanmyfood.129-80-138-126.sslip.io` as two rootless podman containers (`scanmyfood-api`, `scanmyfood-redis`) managed by systemd user units (`deploy/quadlet/`), behind the VM's nginx.
+
+- **Deploy:** commit, then run `./deploy/deploy.sh`. It uploads `git HEAD`, rebuilds the image, restarts the API and waits for `/health/`.
+- **Secrets:** `~/scanmyfood/api.env` on the VM (mode 600), based on `deploy/api.env.example`. Edit it, then restart with `systemctl --user restart scanmyfood-api`.
+- **nginx:** `/etc/nginx/conf.d/scanmyfood.conf` comes from `deploy/nginx-scanmyfood.conf`, plus the HTTPS block that certbot added on the server. If you re-copy the repo file, rerun `sudo certbot --nginx -d scanmyfood.129-80-138-126.sslip.io`. Certificates renew automatically through the existing certbot cron job.
+- **Logs:** `journalctl --user -u scanmyfood-api -f`
+- **Limits:** API memory is capped at 450 MB and Redis at 128 MB. The API runs at lower CPU priority (`Nice=10`) than the VM's other apps. gunicorn handles 8 requests at once (2 workers × 4 threads).
+
+### Under heavy load
+| Limit | What happens |
+| --- | --- |
+| More than 5 requests/s from one IP (burst of 20) | nginx returns `429` JSON right away |
+| More than 6 photo uploads/min from one IP (burst of 3) | nginx returns `429` |
+| Upload over 10 MB | `413` JSON |
+| USDA rate limit (about 1,000 requests/hour per key) | `503` "try again in a minute", and USDA calls pause for 60 s |
+| Gemini share used up (daily or per-minute) | `503` "photo scanning isn't available right now" |
+| API down or restarting | nginx returns `503` JSON. systemd restarts a crashed API within about 6 s. |
