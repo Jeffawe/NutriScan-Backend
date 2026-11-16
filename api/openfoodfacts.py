@@ -7,11 +7,16 @@ Nutri-Score, NOVA processing level, curated allergen/trace tags, additive E-numb
 Data is licensed ODbL - the frontend shows an attribution on Open Food Facts products.
 Rate limit for product lookups is 100 req/min (per server IP), so results are cached by the caller.
 """
+import re
+
 import requests
 
 from .nutrition import build_analysis, empty_nutrient_values, find_allergens
 
 OFF_PRODUCT_URL = 'https://world.openfoodfacts.org/api/v2/product/{barcode}'
+# Full-text product search ("search-a-licious"); the old /cgi/search.pl endpoint is unreliable
+OFF_SEARCH_URL = 'https://search.openfoodfacts.org/search'
+OFF_SEARCH_TIMEOUT = 6  # seconds; text search runs alongside USDA, so keep it snappy
 # OFF asks API users to identify their app in the User-Agent
 OFF_USER_AGENT = 'ScanMyFood/1.0 (+https://scanmyfood.vercel.app)'
 OFF_TIMEOUT = 10  # seconds
@@ -104,9 +109,16 @@ def _tag_names(tags):
     return [tag.split(':', 1)[-1].strip().lower() for tag in tags or [] if tag]
 
 
+def _as_text(value):
+    """Search results sometimes return lists (e.g. brands=['Sara Lee']) where the product API has text."""
+    if isinstance(value, list):
+        return ', '.join(str(v) for v in value if v)
+    return str(value or '')
+
+
 def _first_text(product, *keys):
     for key in keys:
-        value = (product.get(key) or '').strip()
+        value = _as_text(product.get(key)).strip()
         if value:
             return value
     return None
@@ -151,7 +163,8 @@ def process_off_product(product):
 
     basic_info = {
         'name': _first_text(product, 'product_name_en', 'product_name', 'generic_name') or 'Unknown Product',
-        'brand': brands.split(',')[0].strip() if brands else 'Unknown Brand',
+        'brand': brands.split(',')[0].strip() if brands else None,
+        'data_type': 'Open Food Facts',
         'id': None,  # no USDA FDC ID; the barcode is the identifier
         'upc': product.get('code'),
         'category': _pick_category(categories),
@@ -219,3 +232,39 @@ def process_off_product(product):
         analysis['key_highlights'].append("Ultra-processed (NOVA 4)")
 
     return {'basic_info': basic_info, 'nutrients': nutrients, 'analysis': analysis}
+
+
+def _query_words(query):
+    return [w for w in re.findall(r"[a-z0-9]+", query.lower()) if len(w) > 1]
+
+
+def search_products(query, limit=10):
+    """
+    Text search Open Food Facts (worldwide products). Its ranking is fuzzy, so only products whose
+    name or brand contains every word of the query are kept. Raises OpenFoodFactsError on failure.
+    """
+    words = _query_words(query)
+    if not words:
+        return []
+    try:
+        response = requests.get(
+            OFF_SEARCH_URL,
+            params={'q': query, 'page_size': 30, 'fields': OFF_FIELDS},
+            headers={'User-Agent': OFF_USER_AGENT, 'accept': 'application/json'},
+            timeout=OFF_SEARCH_TIMEOUT,
+        )
+        response.raise_for_status()
+        hits = response.json().get('hits', [])
+    except (requests.RequestException, ValueError) as e:
+        raise OpenFoodFactsError(str(e)) from e
+
+    results = []
+    for product in hits:
+        if not product.get('code'):
+            continue
+        text = ' '.join(_as_text(product.get(k)) for k in ('product_name', 'product_name_en', 'brands')).lower()
+        if all(word in text for word in words):
+            results.append(process_off_product(product))
+        if len(results) >= limit:
+            break
+    return results

@@ -142,7 +142,10 @@ def process_usda_food(food_data):
     """
     basic_info = {
         'name': food_data.get('description', 'Unknown Food'),
-        'brand': food_data.get('brandOwner', food_data.get('brandName', 'Unknown Brand')),
+        # Only USDA "Branded" foods have a brand. Foundation / SR Legacy / FNDDS are generic reference
+        # foods (lab-analysed averages, e.g. "Peanut butter, smooth"), so they have no brand at all.
+        'brand': food_data.get('brandOwner') or food_data.get('brandName') or None,
+        'data_type': food_data.get('dataType'),
         'id': food_data.get('fdcId', None),
         'upc': food_data.get('gtinUpc', None),
         'category': food_data.get('foodCategory', food_data.get('brandedFoodCategory', None)),

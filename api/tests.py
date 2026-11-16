@@ -1,5 +1,7 @@
 from unittest import mock
 
+import requests
+
 from django.test import RequestFactory, SimpleTestCase
 
 from . import views
@@ -229,6 +231,9 @@ class ImageAnalysisViewTests(SimpleTestCase):
         patcher = mock.patch.object(views, 'redis_client', self.redis)
         patcher.start()
         self.addCleanup(patcher.stop)
+        off = mock.patch.object(views, 'search_off_cached', return_value=[])
+        off.start()
+        self.addCleanup(off.stop)
         self.factory = RequestFactory()
 
     def post_image(self, content=b'fake-jpeg-bytes', content_type='image/jpeg', ip='9.9.9.9'):
@@ -310,6 +315,9 @@ class UsdaBusyTests(SimpleTestCase):
         patcher = mock.patch.object(views, 'redis_client', self.redis)
         patcher.start()
         self.addCleanup(patcher.stop)
+        off = mock.patch.object(views, 'search_off_cached', return_value=[])
+        off.start()
+        self.addCleanup(off.stop)
         self.view = views.FoodProductViewMany.as_view()
         self.factory = RequestFactory()
 
@@ -356,3 +364,63 @@ class GeminiTimeoutFallbackTests(GeminiQuotaTests):
         self.analyzer.client.models.generate_content.side_effect = [
             Exception('The read operation timed out'), mock.Mock(text='banana')]
         self.assertEqual(self.analyzer.analyze_image(b'x'), 'banana')
+
+
+class SearchFoodsTests(SimpleTestCase):
+    def setUp(self):
+        self.redis = FakeRedis()
+        patcher = mock.patch.object(views, 'redis_client', self.redis)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def usda(self, *pages):
+        return mock.patch('api.views.requests.request', side_effect=[fake_response(p) for p in pages])
+
+    def test_exact_match_first(self):
+        exact = {'totalPages': 1, 'foods': [{'description': 'AMBROSIA PEANUT BUTTER', 'dataType': 'Branded',
+                                             'brandOwner': 'Ambrosia', 'foodNutrients': []}]}
+        with self.usda(exact) as usda, mock.patch.object(views, 'search_off_cached', return_value=[]):
+            result = views.search_foods('ambrosia peanut butter')
+        self.assertTrue(result['exactMatch'])
+        self.assertNotIn('notice', result)
+        self.assertTrue(usda.call_args.kwargs['json']['requireAllWords'])
+        self.assertEqual(usda.call_count, 1)
+
+    def test_falls_back_to_loose_search_with_notice(self):
+        loose = {'totalPages': 3, 'foods': [{'description': 'Peanut butter', 'dataType': 'Survey (FNDDS)',
+                                             'foodNutrients': []}]}
+        with self.usda({'totalPages': 0, 'foods': []}, loose) as usda, \
+                mock.patch.object(views, 'search_off_cached', return_value=[]):
+            result = views.search_foods('ambrosia peanut butter')
+        self.assertFalse(result['exactMatch'])
+        self.assertIn('No exact match', result['notice'])
+        self.assertEqual([c.kwargs['json']['requireAllWords'] for c in usda.call_args_list], [True, False])
+        food = result['data'][0]['basic_info']
+        self.assertIsNone(food['brand'])               # generic USDA foods have no brand
+        self.assertEqual(food['data_type'], 'Survey (FNDDS)')
+
+    def test_open_food_facts_results_come_first(self):
+        off = [process_off_product(dict(OpenFoodFactsTests.PRODUCT, product_name='Ambrosia Organic Peanut Butter'))]
+        with self.usda({'totalPages': 0, 'foods': []}, {'totalPages': 0, 'foods': []}), \
+                mock.patch.object(views, 'search_off_cached', return_value=off):
+            result = views.search_foods('ambrosia peanut butter')
+        self.assertEqual(result['data'][0]['basic_info']['name'], 'Ambrosia Organic Peanut Butter')
+
+    def test_usda_down_still_shows_open_food_facts(self):
+        off = [process_off_product(OpenFoodFactsTests.PRODUCT)]
+        with mock.patch('api.views.requests.request', side_effect=requests.ConnectionError('down')), \
+                mock.patch.object(views, 'search_off_cached', return_value=off):
+            result = views.search_foods('nutella')
+        self.assertEqual(len(result['data']), 1)
+        self.assertIn('USDA is unavailable', result['notice'])
+
+    def test_off_search_keeps_only_full_word_matches(self):
+        from .openfoodfacts import search_products
+        hits = {'hits': [
+            {'code': '1', 'product_name': 'Little bites', 'brands': ['Sara Lee']},
+            {'code': '2', 'product_name': 'Ambrosia Organic Peanut Butter', 'nutriments': {}},
+            {'code': '3', 'product_name': 'Peanut butter', 'brands': ['Skippy']},
+        ]}
+        with mock.patch('api.openfoodfacts.requests.get', return_value=fake_response(hits)):
+            names = [r['basic_info']['name'] for r in search_products('ambrosia peanut butter')]
+        self.assertEqual(names, ['Ambrosia Organic Peanut Butter'])

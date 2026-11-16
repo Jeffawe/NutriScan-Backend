@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 
 import redis
 import requests
+from concurrent.futures import ThreadPoolExecutor
 from django.shortcuts import render
 from dotenv import load_dotenv
 from google import genai
@@ -18,6 +19,7 @@ from rest_framework.views import APIView
 from .nutrition import process_usda_food
 from .openfoodfacts import (OpenFoodFactsError, fetch_product, normalize_barcode,
                             process_off_product)
+from .openfoodfacts import search_products as search_off_products
 
 # Get the directory of the current script
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -120,34 +122,102 @@ def usda_error_response(error):
     return Response({"error": "Food database is unavailable. Please try again."}, status=502)
 
 
-def search_usda(product_name, page_number=1):
-    """Search USDA FoodData Central (cached). Raises USDAError on upstream failure."""
-    normalized = product_name.strip().lower()
-    cache_key = f"food_search:{normalized}:page:{page_number}"
-    cached_result = redis_client.get(cache_key)
-    if cached_result:
-        return json.loads(cached_result)
-
+def _usda_search_page(query, page_number, require_all_words):
     # POST with a JSON body: USDA's GET endpoint rejects (400) a comma-separated
     # dataType list once it includes "Survey (FNDDS)" alongside other types
     body = {
-        'query': normalized,
+        'query': query,
         'pageSize': 25,
         'pageNumber': page_number,
         'dataType': USDA_DATA_TYPES,
+        'requireAllWords': require_all_words,
     }
     response = usda_request('POST', USDA_SEARCH_URL, params={'api_key': os.getenv('USDA_API_KEY')}, json=body)
     try:
         response.raise_for_status()
-        food_data = response.json()
+        return response.json()
     except (requests.RequestException, ValueError) as e:
         raise USDAError(str(e)) from e
+
+
+def search_usda(product_name, page_number=1):
+    """
+    Search USDA FoodData Central (cached). Raises USDAError on upstream failure.
+
+    USDA matches *any* word by default, so "ambrosia peanut butter" returns every peanut butter.
+    We ask for foods containing *all* the words first and only fall back to the loose search
+    when nothing matches; `exactMatch` tells the caller which one happened.
+    """
+    normalized = product_name.strip().lower()
+    cache_key = f"food_search:v2:{normalized}:page:{page_number}"
+    cached_result = redis_client.get(cache_key)
+    if cached_result:
+        return json.loads(cached_result)
+
+    food_data = _usda_search_page(normalized, page_number, require_all_words=True)
+    exact = bool(food_data.get('foods'))
+    if not exact:
+        food_data = _usda_search_page(normalized, page_number, require_all_words=False)
 
     result = {
         "totalPages": food_data.get('totalPages', 0),
         "data": [process_usda_food(data) for data in food_data.get('foods', [])],
+        "exactMatch": exact,
     }
     redis_client.setex(cache_key, CACHE_TTL, json.dumps(result))
+    return result
+
+
+def search_off_cached(query):
+    """Open Food Facts text search (worldwide branded products), cached for a day."""
+    normalized = query.strip().lower()
+    cache_key = f"off_search:{normalized}"
+    try:
+        cached = redis_client.get(cache_key)
+        if cached:
+            return json.loads(cached)
+    except redis.exceptions.RedisError:
+        pass
+    results = search_off_products(normalized)
+    try:
+        redis_client.setex(cache_key, CACHE_TTL, json.dumps(results))
+    except redis.exceptions.RedisError:
+        pass
+    return results
+
+
+def search_foods(query, page_number=1):
+    """
+    Text search across both databases, run in parallel:
+    - USDA (US branded + generic reference foods), paginated
+    - Open Food Facts (worldwide products), first page only, shown first since they're exact brand/name hits
+    If one source fails, results from the other are still returned. Raises USDAError only if
+    USDA fails and Open Food Facts found nothing.
+    """
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        usda_future = pool.submit(search_usda, query, page_number)
+        off_future = pool.submit(search_off_cached, query) if page_number == 1 else None
+
+        off_results = []
+        if off_future is not None:
+            try:
+                off_results = off_future.result()
+            except OpenFoodFactsError as e:
+                print(f"Open Food Facts search error: {e}")
+
+        try:
+            result = dict(usda_future.result())
+        except USDAError:
+            if not off_results:
+                raise
+            result = {"totalPages": 1, "data": [], "exactMatch": False,
+                      "notice": "Only showing Open Food Facts results right now (USDA is unavailable)."}
+
+    if off_results:
+        result["data"] = off_results + result["data"]
+    elif not result.get("exactMatch") and result.get("data"):
+        result["notice"] = (f'No exact match for "{query.strip()}". Showing the closest results instead. '
+                            "Scanning the barcode is the most reliable way to find a specific product.")
     return result
 
 
@@ -285,7 +355,7 @@ class FoodProductViewMany(APIView):
             return Response({"error": "'page' must be a number"}, status=400)
 
         try:
-            result = search_usda(product_name, page_number)
+            result = search_foods(product_name, page_number)
         except USDAError as e:
             return usda_error_response(e)
 
@@ -579,7 +649,7 @@ class FoodImageAnalysisView(APIView):
 
     def get_food_details(self, product_name):
         """Search USDA for the detected name (shares the search cache with FoodProductViewMany)."""
-        result = dict(search_usda(product_name, 1))
+        result = dict(search_foods(product_name, 1))
         result["searchTerm"] = product_name
         return result
 
