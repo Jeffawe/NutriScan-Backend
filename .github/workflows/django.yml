@@ -13,12 +13,12 @@ jobs:
     strategy:
       max-parallel: 4
       matrix:
-        python-version: [3.14]
+        python-version: ["3.12"]
 
     steps:
     - uses: actions/checkout@v4
     - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v3
+      uses: actions/setup-python@v5
       with:
         python-version: ${{ matrix.python-version }}
     - name: Install Dependencies
@@ -26,5 +26,7 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
     - name: Run Tests
+      env:
+        SECRET_KEY: ci-test-secret-key
       run: |
-        python manage.py test
+        python manage.py test api

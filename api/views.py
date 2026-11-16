@@ -1,17 +1,23 @@
+import hashlib
+import ipaddress
 import json
-from rest_framework.views import APIView
-from rest_framework.response import Response
-from rest_framework.parsers import MultiPartParser, FormParser
-import requests
-from dotenv import load_dotenv
 import os
-from django.shortcuts import render
-from gradio_client import Client, handle_file
-import spacy
-import tempfile
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
 import redis
+import requests
+from django.shortcuts import render
+from dotenv import load_dotenv
 from google import genai
-from django.http import JsonResponse
+from google.genai import types as genai_types
+from rest_framework.parsers import MultiPartParser, FormParser
+from rest_framework.response import Response
+from rest_framework.views import APIView
+
+from .nutrition import process_usda_food
+from .openfoodfacts import (OpenFoodFactsError, fetch_product, normalize_barcode,
+                            process_off_product)
 
 # Get the directory of the current script
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -24,14 +30,92 @@ redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379/0')
 redis_client = redis.from_url(redis_url)
 CACHE_TTL = 60 * 60 * 24  # Cache for 24 hours
 
-nlp = spacy.load("en_core_web_sm")
+# ---- Gemini free-tier budget --------------------------------------------------------------
+# Set these to the limits shown for your project at https://aistudio.google.com (Rate limits page).
+# Defaults are the lowest recently reported free-tier limits for gemini-2.5-flash.
+GEMINI_FREE_RPM = int(os.getenv('GEMINI_FREE_RPM', 5))    # requests per minute
+GEMINI_FREE_RPD = int(os.getenv('GEMINI_FREE_RPD', 20))   # requests per day (resets midnight Pacific)
+GEMINI_QUOTA_SHARE = float(os.getenv('GEMINI_QUOTA_SHARE', 0.5))  # use at most this share of each limit
+APP_GEMINI_RPM = max(1, int(GEMINI_FREE_RPM * GEMINI_QUOTA_SHARE))
+APP_GEMINI_RPD = max(1, int(GEMINI_FREE_RPD * GEMINI_QUOTA_SHARE))
+# Photo scans that reach Gemini per IP per day (cached photos don't count)
+MAX_IMAGE_REQUESTS_PER_IP = int(os.getenv('MAX_IMAGE_REQUESTS_PER_IP', 3))
+PACIFIC = ZoneInfo('America/Los_Angeles')
+MAX_BARCODE_REQUESTS = int(os.getenv('MAX_BARCODE_REQUESTS', 120))  # per IP per hour
 
-Max_Requests = int(os.getenv('MAX_REQUESTS', 30))
-Max_LLM_Requests = int(os.getenv('MAX_LLM_REQUESTS', 10))
+GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-2.5-flash')
+MAX_IMAGE_BYTES = int(os.getenv('MAX_IMAGE_BYTES', 10 * 1024 * 1024))  # 10 MB
+# Number of public proxies in front of the app that append to X-Forwarded-For (Render: 1)
+TRUSTED_PROXY_COUNT = max(1, int(os.getenv('TRUSTED_PROXY_COUNT', 1)))
+
+USDA_SEARCH_URL = 'https://api.nal.usda.gov/fdc/v1/foods/search'
+USDA_FOOD_URL = 'https://api.nal.usda.gov/fdc/v1/food/{fdc_id}'
+USDA_TIMEOUT = 15  # seconds
+# Foundation + SR Legacy + FNDDS cover generic/whole foods ("banana", "grilled chicken"),
+# which is what image recognition usually returns; Branded covers packaged products.
+USDA_DATA_TYPES = ['Foundation', 'SR Legacy', 'Survey (FNDDS)', 'Branded']
+
+# Monthly counters are keyed by calendar month so they reset automatically
+MONTH_KEY_TTL = 60 * 60 * 24 * 40  # keep a bit longer than a month, then let Redis drop it
+
+PHOTO_UNAVAILABLE_MESSAGE = ("Photo scanning isn't available right now. Please try again later, "
+                             "or scan the barcode or search by name instead.")
+
+
+def month_key(prefix):
+    return f"{prefix}:{datetime.now(timezone.utc):%Y-%m}"
 
 
 def home(request):
     return render(request, 'home.html')
+
+
+class USDAError(Exception):
+    pass
+
+
+def search_usda(product_name, page_number=1):
+    """Search USDA FoodData Central (cached). Raises USDAError on upstream failure."""
+    normalized = product_name.strip().lower()
+    cache_key = f"food_search:{normalized}:page:{page_number}"
+    cached_result = redis_client.get(cache_key)
+    if cached_result:
+        return json.loads(cached_result)
+
+    # POST with a JSON body: USDA's GET endpoint rejects (400) a comma-separated
+    # dataType list once it includes "Survey (FNDDS)" alongside other types
+    body = {
+        'query': normalized,
+        'pageSize': 25,
+        'pageNumber': page_number,
+        'dataType': USDA_DATA_TYPES,
+    }
+    try:
+        response = requests.post(USDA_SEARCH_URL, headers={'accept': 'application/json'},
+                                 params={'api_key': os.getenv('USDA_API_KEY')}, json=body,
+                                 timeout=USDA_TIMEOUT)
+        response.raise_for_status()
+        food_data = response.json()
+    except (requests.RequestException, ValueError) as e:
+        raise USDAError(str(e)) from e
+
+    result = {
+        "totalPages": food_data.get('totalPages', 0),
+        "data": [process_usda_food(data) for data in food_data.get('foods', [])],
+    }
+    redis_client.setex(cache_key, CACHE_TTL, json.dumps(result))
+    return result
+
+
+def find_usda_by_barcode(barcode):
+    """USDA branded foods carry a GTIN/UPC; search for it and keep only exact matches."""
+    result = search_usda(barcode, 1)
+    wanted = barcode.lstrip('0')
+    for food in result.get('data', []):
+        upc = (food['basic_info'].get('upc') or '').lstrip('0')
+        if upc and upc == wanted:
+            return food
+    return None
 
 
 class RateLimiter:
@@ -42,45 +126,39 @@ class RateLimiter:
     @staticmethod
     def get_client_ip(request):
         """
-        Extract client IP address from request
+        Extract the client IP address from the request.
+
+        The left-most X-Forwarded-For entry is whatever the client sent, so it can be faked to
+        dodge rate limits. Proxies *append* to the header, so we read it from the right instead:
+        skip internal/private hops, then skip TRUSTED_PROXY_COUNT - 1 public proxy hops.
         """
         x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
-        if x_forwarded_for:
-            ip = x_forwarded_for.split(',')[0]
-        else:
-            ip = request.META.get('REMOTE_ADDR')
-        return ip
+        if not x_forwarded_for:
+            return request.META.get('REMOTE_ADDR')
+
+        public_hops = []
+        for hop in (h.strip() for h in x_forwarded_for.split(',')):
+            try:
+                addr = ipaddress.ip_address(hop)
+            except ValueError:
+                continue
+            if addr.is_global:  # skips private, loopback, link-local, CGNAT and reserved ranges
+                public_hops.append(hop)
+
+        if not public_hops:
+            return request.META.get('REMOTE_ADDR')
+
+        return public_hops[max(0, len(public_hops) - TRUSTED_PROXY_COUNT)]
 
     @staticmethod
-    def should_use_bert(request):
-        """
-        Determine if BERT model should be used based on request count
+    def hit(request, bucket, window=3600):
+        """Count a request for this IP in `bucket` and return the count within the window."""
+        key = f"rate_limit:{RateLimiter.get_client_ip(request)}:{bucket}"
+        count = redis_client.incr(key)
+        if count == 1:
+            redis_client.expire(key, window)
+        return count
 
-        Returns:
-            tuple: (use_bert, can_continue)
-                - use_bert: Whether to switch to BERT model
-                - can_continue: Whether to allow the request
-        """
-        # Get client IP
-        ip = RateLimiter.get_client_ip(request)
-
-        # Create unique key for this IP and endpoint
-        rate_limit_key = f"rate_limit:{ip}:food_image_analysis"
-
-        # Increment request count and get current count
-        request_count = redis_client.incr(rate_limit_key)
-
-        # Set expiration if this is the first request
-        if request_count == 1:
-            redis_client.expire(rate_limit_key, 3600)  # 1-hour window
-
-        # Check thresholds
-        if request_count > Max_Requests:
-            # Too many requests - block
-            return False, False
-
-        # Switch to BERT after 10 requests
-        return request_count > Max_LLM_Requests, True
 
 
 class GlobalAPIUsageMiddleware:
@@ -91,701 +169,373 @@ class GlobalAPIUsageMiddleware:
     def __init__(self, get_response):
         self.get_response = get_response
         self.TOTAL_MONTHLY_API_LIMIT = int(os.getenv('MONTHLY_API_LIMIT', 5000000))  # Total monthly API calls
-        self.API_USAGE_KEY = "global_api_usage:current_month"
-        if not redis_client.exists(self.API_USAGE_KEY):
-            redis_client.set(self.API_USAGE_KEY, 0, ex=2592000)
 
     def __call__(self, request):
-        # Check global API usage before processing request
-        current_usage = int(redis_client.get(self.API_USAGE_KEY) or 0)
-
-        if current_usage >= self.TOTAL_MONTHLY_API_LIMIT:
-            # Set a custom attribute on the request
-            request.api_limit_exceeded = True
-        else:
-            # Increment global API usage
-            redis_client.incr(self.API_USAGE_KEY)
+        # Key is per calendar month, so the count resets on the 1st without relying on a startup-time TTL
+        usage_key = month_key("global_api_usage")
+        try:
+            current_usage = redis_client.incr(usage_key)
+            if current_usage == 1:
+                redis_client.expire(usage_key, MONTH_KEY_TTL)
+            request.api_limit_exceeded = current_usage > self.TOTAL_MONTHLY_API_LIMIT
+        except redis.exceptions.RedisError as e:
+            # Don't take the whole API down if Redis is unavailable
+            print(f"Redis error in usage middleware: {e}")
             request.api_limit_exceeded = False
 
-        response = self.get_response(request)
-        return response
+        return self.get_response(request)
 
-# Create your views here.
+
 class FoodProductView(APIView):
     def get(self, request):
-        # Get Product Name from React request
         product_id = request.query_params.get('fcID')
 
         if not product_id:
             return Response({"error": "Missing 'fcID' parameter"}, status=400)
 
-        # Check if result is in Redis cache
+        product_id = product_id.strip()
+        if not product_id.isdigit():
+            return Response({"error": "'fcID' must be a numeric FDC ID"}, status=400)
+
         cache_key = f"food_product:{product_id}"
         cached_result = redis_client.get(cache_key)
-
         if cached_result:
-            # Return cached result if available
             return Response(json.loads(cached_result))
 
-        # If not in cache, fetch from API
-        api_key = os.getenv('USDA_API_KEY')
-
-        headers = {
-            'accept': 'application/json',
-        }
-
-        usda_api_url = f'https://api.nal.usda.gov/fdc/v1/food/{product_id}'
         params = {
             'format': 'full',
-            'api_key': api_key
+            'api_key': os.getenv('USDA_API_KEY')
         }
 
-        response = requests.get(usda_api_url, headers=headers, params=params)
-        food_data = response.json()
+        try:
+            response = requests.get(USDA_FOOD_URL.format(fdc_id=product_id),
+                                    headers={'accept': 'application/json'},
+                                    params=params, timeout=USDA_TIMEOUT)
+            if response.status_code == 404:
+                return Response({"error": f"No food found with FDC ID {product_id}"}, status=404)
+            response.raise_for_status()
+            food_data = response.json()
+        except (requests.RequestException, ValueError) as e:
+            print(f"USDA API error: {e}")
+            return Response({"error": "Food database is unavailable. Please try again."}, status=502)
 
-        processed_data = self.process_food_data(food_data=food_data)
+        processed_data = process_usda_food(food_data)
 
-        # Cache the result in Redis
-        redis_client.setex(
-            cache_key,
-            CACHE_TTL,
-            json.dumps(processed_data)
-        )
+        redis_client.setex(cache_key, CACHE_TTL, json.dumps(processed_data))
 
         return Response(processed_data)
 
-    @staticmethod
-    def process_food_data(food_data):
-        """
-        Process food data from data.gov API into a structured format.
-        Handles multiple data formats, missing data, and extracts comprehensive nutritional information.
-
-        Args:
-            food_data (dict): Raw food data from data.gov API
-
-        Returns:
-            dict: Processed food information with basic info, nutrients, and analysis
-        """
-        # Group nutrients by category
-        nutrient_categories = {
-            'macronutrients': ['Protein', 'Total lipid (fat)', 'Carbohydrate, by difference'],
-            'vitamins': ['Vitamin A', 'Vitamin C', 'Vitamin D', 'Vitamin E', 'Vitamin K',
-                         'Thiamin', 'Riboflavin', 'Niacin', 'Vitamin B-6', 'Folate', 'Vitamin B-12'],
-            'minerals': ['Calcium', 'Iron', 'Magnesium', 'Phosphorus', 'Potassium', 'Sodium', 'Zinc',
-                         'Copper', 'Selenium'],
-            'other': ['Fiber, total dietary', 'Total Sugars', 'Cholesterol',
-                      'Fatty acids, total saturated', 'Fatty acids, total trans']
-        }
-
-        # Extract comprehensive basic info
-        basic_info = {
-            'name': food_data.get('description', 'Unknown Food'),
-            'brand': food_data.get('brandOwner', food_data.get('brandName', 'Unknown Brand')),
-            'id': food_data.get('fdcId', None),
-            'upc': food_data.get('gtinUpc', None),
-            'category': food_data.get('foodCategory', food_data.get('brandedFoodCategory', None)),
-            'ingredients': food_data.get('ingredients', None),
-            'serving_size': food_data.get('servingSize', None),
-            'serving_unit': food_data.get('servingSizeUnit', None),
-            'household_serving': food_data.get('householdServingFullText', None),
-            'calories': None,  # Will be updated if available
-            'published_date': food_data.get('publishedDate', food_data.get('publicationDate', None)),
-            'market_country': food_data.get('marketCountry', None),
-            'available_date': food_data.get('availableDate', None),
-            'discontinued_date': food_data.get('discontinuedDate', None),
-        }
-
-        # Initialize nutrients structure
-        nutrients = {category: [] for category in nutrient_categories}
-
-        # Track specific nutrients for health metrics
-        nutrient_values = {
-            'calories': None,
-            'fat': None,
-            'sodium': None,
-            'fiber': None,
-            'protein': None,
-            'carbs': None,
-            'sugars': None,
-            'cholesterol': None,
-            'saturated_fat': None,
-            'trans_fat': None,
-        }
-
-        # Get label nutrients if available (new format)
-        if 'labelNutrients' in food_data and food_data['labelNutrients']:
-            label_nutrients = food_data['labelNutrients']
-            if 'calories' in label_nutrients and label_nutrients['calories'] is not None:
-                nutrient_values['calories'] = label_nutrients['calories'].get('value')
-                basic_info['calories'] = nutrient_values['calories']
-
-            if 'fat' in label_nutrients and label_nutrients['fat'] is not None:
-                nutrient_values['fat'] = label_nutrients['fat'].get('value')
-
-            if 'sodium' in label_nutrients and label_nutrients['sodium'] is not None:
-                nutrient_values['sodium'] = label_nutrients['sodium'].get('value')
-
-            if 'protein' in label_nutrients and label_nutrients['protein'] is not None:
-                nutrient_values['protein'] = label_nutrients['protein'].get('value')
-
-            if 'carbohydrates' in label_nutrients and label_nutrients['carbohydrates'] is not None:
-                nutrient_values['carbs'] = label_nutrients['carbohydrates'].get('value')
-
-        # Process food nutrients if available in original format
-        if 'foodNutrients' in food_data and food_data['foodNutrients']:
-            for nutrient in food_data['foodNutrients']:
-                # Handle different nutrient data structures
-                if 'nutrientName' in nutrient:
-                    # Original format
-                    nutrient_name = nutrient.get('nutrientName', '')
-                    amount = nutrient.get('value')
-                    unit = nutrient.get('unitName', '')
-                    daily_value = nutrient.get('percentDailyValue')
-                elif 'nutrient' in nutrient:
-                    # New format with nested nutrient object
-                    nutrient_name = nutrient['nutrient'].get('name', '')
-                    amount = nutrient.get('amount')
-                    unit = nutrient['nutrient'].get('unitName', '')
-                    daily_value = None  # This format might not include percentDailyValue
-                else:
-                    continue  # Skip if essential structure is missing
-
-                # Skip if essential data is missing
-                if not nutrient_name or amount is None:
-                    continue
-
-                # Get calories
-                if nutrient_name == 'Energy':
-                    basic_info['calories'] = amount
-                    nutrient_values['calories'] = amount
-
-                # Extract key nutrients for health metrics
-                if 'Total lipid (fat)' in nutrient_name:
-                    nutrient_values['fat'] = amount
-                elif 'Sodium' in nutrient_name:
-                    nutrient_values['sodium'] = amount
-                elif 'Fiber, total dietary' in nutrient_name:
-                    nutrient_values['fiber'] = amount
-                elif nutrient_name == 'Protein':
-                    nutrient_values['protein'] = amount
-                elif 'Carbohydrate' in nutrient_name:
-                    nutrient_values['carbs'] = amount
-                elif 'Total Sugars' in nutrient_name:
-                    nutrient_values['sugars'] = amount
-                elif 'Cholesterol' in nutrient_name:
-                    nutrient_values['cholesterol'] = amount
-                elif 'saturated' in nutrient_name.lower():
-                    nutrient_values['saturated_fat'] = amount
-                elif 'trans' in nutrient_name.lower():
-                    nutrient_values['trans_fat'] = amount
-
-                # Categorize nutrients
-                categorized = False
-                for category, nutrient_list in nutrient_categories.items():
-                    if any(n in nutrient_name for n in nutrient_list):
-                        nutrients[category].append({
-                            'name': nutrient_name,
-                            'amount': amount,
-                            'unit': unit,
-                            'daily_value_percent': daily_value
-                        })
-                        categorized = True
-                        break
-
-                # Add to "other" if not categorized and has a value
-                if not categorized and amount is not None:
-                    nutrients['other'].append({
-                        'name': nutrient_name,
-                        'amount': amount,
-                        'unit': unit,
-                        'daily_value_percent': daily_value
-                    })
-
-        # Add analysis and insights
-        analysis = {
-            'health_metrics': {
-                'is_low_fat': nutrient_values['fat'] is not None and nutrient_values['fat'] <= 3,
-                'is_low_sodium': nutrient_values['sodium'] is not None and nutrient_values['sodium'] <= 140,
-                'is_high_fiber': nutrient_values['fiber'] is not None and nutrient_values['fiber'] >= 5,
-                'is_low_calorie': nutrient_values['calories'] is not None and nutrient_values['calories'] <= 40,
-                'is_high_protein': nutrient_values['protein'] is not None and nutrient_values['protein'] >= 5,
-            },
-            'nutritional_profile': {},
-            'key_highlights': [],
-            'additives': [],
-            'allergens': []
-        }
-
-        # Check for common allergens in ingredients
-        common_allergens = [
-            "milk", "dairy", "egg", "peanut", "tree nut", "soy", "wheat",
-            "gluten", "fish", "shellfish", "sesame"
-        ]
-
-        # Check for common additives
-        common_additives = [
-            "aspartame", "sucralose", "saccharin", "high fructose", "msg",
-            "monosodium glutamate", "artificial", "preservative", "benzoate",
-            "nitrite", "nitrate", "bht", "bha", "red dye", "yellow dye", "blue dye"
-        ]
-
-        # Process ingredients for additives and allergens if available
-        if basic_info['ingredients']:
-            ingredients_lower = basic_info['ingredients'].lower()
-
-            # Check for allergens
-            found_allergens = []
-            for allergen in common_allergens:
-                if allergen in ingredients_lower:
-                    found_allergens.append(allergen)
-
-            if found_allergens:
-                analysis['allergens'] = found_allergens
-
-            # Check for additives
-            found_additives = []
-            for additive in common_additives:
-                if additive in ingredients_lower:
-                    found_additives.append(additive)
-
-            if found_additives:
-                analysis['additives'] = found_additives
-
-        # Add nutritional profile analysis
-        if nutrient_values['calories'] is not None:
-            analysis['nutritional_profile']['calories_per_serving'] = nutrient_values['calories']
-
-        if nutrient_values['fat'] is not None and nutrient_values['calories'] is not None and nutrient_values[
-            'calories'] > 0:
-            fat_cal_percent = (nutrient_values['fat'] * 9 / nutrient_values['calories']) * 100
-            analysis['nutritional_profile']['fat_calories_percent'] = round(fat_cal_percent, 1)
-
-        if nutrient_values['protein'] is not None and nutrient_values['calories'] is not None and nutrient_values[
-            'calories'] > 0:
-            protein_cal_percent = (nutrient_values['protein'] * 4 / nutrient_values['calories']) * 100
-            analysis['nutritional_profile']['protein_calories_percent'] = round(protein_cal_percent, 1)
-
-        if nutrient_values['carbs'] is not None and nutrient_values['calories'] is not None and nutrient_values[
-            'calories'] > 0:
-            carbs_cal_percent = (nutrient_values['carbs'] * 4 / nutrient_values['calories']) * 100
-            analysis['nutritional_profile']['carbs_calories_percent'] = round(carbs_cal_percent, 1)
-
-        # Generate key highlights
-        highlights = []
-
-        if nutrient_values['calories'] is not None and nutrient_values['calories'] == 0:
-            highlights.append("Zero calories")
-
-        if nutrient_values['sodium'] is not None and nutrient_values['sodium'] > 400:
-            highlights.append("High sodium content")
-        elif nutrient_values['sodium'] is not None and nutrient_values['sodium'] < 140:
-            highlights.append("Low sodium")
-
-        if nutrient_values['fiber'] is not None and nutrient_values['fiber'] >= 5:
-            highlights.append("Good source of fiber")
-
-        if nutrient_values['protein'] is not None and nutrient_values['protein'] >= 5:
-            highlights.append("Good source of protein")
-
-        if nutrient_values['fat'] is not None and nutrient_values['fat'] <= 3:
-            highlights.append("Low fat")
-        elif nutrient_values['fat'] is not None and nutrient_values['fat'] >= 15:
-            highlights.append("High fat content")
-
-        if analysis['additives']:
-            highlights.append("Contains artificial additives")
-
-        if analysis['allergens']:
-            allergen_list = ", ".join(analysis['allergens'])
-            highlights.append(f"Contains allergens: {allergen_list}")
-
-        analysis['key_highlights'] = highlights
-
-        return {
-            'basic_info': basic_info,
-            'nutrients': nutrients,
-            'analysis': analysis
-        }
+    # Kept for backwards compatibility; the logic lives in api/nutrition.py
+    process_food_data = staticmethod(process_usda_food)
 
 
 class FoodProductViewMany(APIView):
     def get(self, request):
-        # Get Product Name from React request
-        product_name = request.query_params.get('name')
-        page_number = int(request.query_params.get('page', 1))
+        product_name = (request.query_params.get('name') or '').strip()
 
         if not product_name:
             return Response({"error": "Missing 'name' parameter"}, status=400)
 
-        # Check if result is in Redis cache
-        cache_key = f"food_search:{product_name}:page:{page_number}"
-        cached_result = redis_client.get(cache_key)
+        try:
+            page_number = max(1, int(request.query_params.get('page', 1)))
+        except ValueError:
+            return Response({"error": "'page' must be a number"}, status=400)
 
-        if cached_result:
-            # Return cached result if available
-            return Response(json.loads(cached_result))
-
-        api_key = os.getenv('USDA_API_KEY')
-
-        headers = {
-            'accept': 'application/json',
-        }
-
-        usda_api_url = 'https://api.nal.usda.gov/fdc/v1/foods/search'
-        params = {
-            'query': product_name,
-            'pageSize': 25,
-            'pageNumber': page_number,
-            'dataType': 'Foundation, Branded',
-            'sortBy': 'publishedDate',
-            'sortOrder': 'asc',
-            'api_key': api_key
-        }
-
-        response = requests.get(usda_api_url, headers=headers, params=params)
-        food_data = response.json()
-        result = {
-            "totalPages": food_data.get('totalPages', 0),
-            "data": []
-        }
-
-        for data in food_data['foods']:
-            processed_data = FoodProductView.process_food_data(food_data=data)
-            result["data"].append(processed_data)
-
-        # Cache the result in Redis
-        redis_client.setex(
-            cache_key,
-            CACHE_TTL,
-            json.dumps(result)
-        )
+        try:
+            result = search_usda(product_name, page_number)
+        except USDAError as e:
+            print(f"USDA API error: {e}")
+            return Response({"error": "Food database is unavailable. Please try again."}, status=502)
 
         return Response(result)
 
 
+class BarcodeLookupView(APIView):
+    """
+    GET /barcode/?code=<EAN/UPC>
+
+    Looks the barcode up in Open Food Facts first (worldwide, Nutri-Score, allergens, photos),
+    then falls back to USDA branded foods (US products, matched by GTIN/UPC).
+    """
+    NOT_FOUND_TTL = 60 * 60  # remember misses for an hour so we don't hammer upstream APIs
+
+    def get(self, request):
+        barcode = normalize_barcode(request.query_params.get('code'))
+        if not barcode:
+            return Response({"error": "Please provide a valid 8-14 digit barcode"}, status=400)
+
+        cache_key = f"barcode:{barcode}"
+        cached = redis_client.get(cache_key)
+        if cached:
+            cached = json.loads(cached)
+            if cached.get('not_found'):
+                return Response({"error": f"No product found for barcode {barcode}"}, status=404)
+            return Response(cached)
+
+        if RateLimiter.hit(request, 'barcode') > MAX_BARCODE_REQUESTS:
+            return Response({'error': 'Rate limit exceeded',
+                             'message': 'Too many barcode lookups. Try again in 1 hour.',
+                             'retry_after': 3600}, status=429)
+
+        upstream_failed = False
+        result = None
+
+        try:
+            product = fetch_product(barcode)
+            if product:
+                result = process_off_product(product)
+        except OpenFoodFactsError as e:
+            print(f"Open Food Facts error: {e}")
+            upstream_failed = True
+
+        if result is None:
+            try:
+                result = find_usda_by_barcode(barcode)
+            except USDAError as e:
+                print(f"USDA API error: {e}")
+                upstream_failed = True
+
+        if result is None:
+            if upstream_failed:
+                # Don't cache: it may well be found once the upstream API is back
+                return Response({"error": "Food databases are unavailable. Please try again."}, status=502)
+            redis_client.setex(cache_key, self.NOT_FOUND_TTL, json.dumps({'not_found': True}))
+            return Response({"error": f"No product found for barcode {barcode}"}, status=404)
+
+        redis_client.setex(cache_key, CACHE_TTL, json.dumps(result))
+        return Response(result)
+
+
 class GeminiImageAnalyzer:
+    """
+    Gemini photo recognition, kept inside a share of the Gemini free-tier quota.
+
+    The free tier limits requests per minute (RPM) and per day (RPD) for each project. Daily
+    quotas reset at midnight Pacific time. We count every call in Redis *before* making it,
+    across all workers and users, and stop at GEMINI_QUOTA_SHARE of each limit. If Gemini still
+    answers 429 (the limits were lowered, or another app shares the key), we back off.
+    """
+    MINUTE_COOLDOWN = 60  # seconds to stop calling after a per-minute 429
+
     def __init__(self):
-        # Initialize Redis for tracking API usage
-        self.redis_client = redis.from_url(redis_url)
+        self.redis_client = redis_client
 
-        # Set up Gemini API key and configuration
+        # genai.Client raises if the key is missing, so only create it when a key is configured
         self.gemini_api_key = os.getenv('GEMINI_API_KEY')
-        self.client = genai.Client(api_key=self.gemini_api_key)
+        self.client = genai.Client(api_key=self.gemini_api_key) if self.gemini_api_key else None
 
-        # Configuration for tracking API usage
-        self.MONTHLY_API_LIMIT = 1000000  # Example monthly limit in tokens/characters
-        self.USAGE_WARN_THRESHOLD = 0.2  # 20% remaining
+    # ---- quota accounting -------------------------------------------------------------
 
-    def track_api_usage(self, tokens_used):
-        """
-        Track Gemini API usage and check against monthly limit
+    @staticmethod
+    def _keys():
+        now_pt = datetime.now(PACIFIC)
+        return (f"gemini:rpm:{now_pt:%Y%m%d%H%M}", f"gemini:rpd:{now_pt:%Y-%m-%d}")
 
-        Args:
-            tokens_used (int): Number of tokens/characters used in this request
+    @staticmethod
+    def _seconds_until_pacific_midnight():
+        now_pt = datetime.now(PACIFIC)
+        tomorrow = (now_pt + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        return max(60, int((tomorrow - now_pt).total_seconds()))
 
-        Returns:
-            bool: True if usage is within limits, False otherwise
-        """
-        current_usage_key = "gemini_api_usage:current_month"
-
-        try:
-            # Get current month's usage
-            current_usage = int(self.redis_client.get(current_usage_key) or 0)
-            new_usage = current_usage + tokens_used
-
-            # Check if usage exceeds limit
-            if new_usage > self.MONTHLY_API_LIMIT * (1 - self.USAGE_WARN_THRESHOLD):
-                return False
-
-            # Update usage
-            self.redis_client.set(current_usage_key, new_usage)
-            return True
-        except redis.exceptions.ConnectionError as e:
-            print(f"Redis connection error: {e}")
+    def _reserve(self):
+        """Atomically claim one request from the app's share. Returns True if the call may go ahead."""
+        if self.redis_client.exists("gemini:cooldown"):
             return False
+        minute_key, day_key = self._keys()
+        pipe = self.redis_client.pipeline()
+        pipe.incr(minute_key)
+        pipe.expire(minute_key, 120)
+        pipe.incr(day_key)
+        pipe.expire(day_key, 60 * 60 * 48)
+        minute_count, _, day_count, _ = pipe.execute()
+        if minute_count > APP_GEMINI_RPM or day_count > APP_GEMINI_RPD:
+            # Give the slot back: this request isn't going to Gemini
+            pipe = self.redis_client.pipeline()
+            pipe.decr(minute_key)
+            pipe.decr(day_key)
+            pipe.execute()
+            return False
+        return True
 
-    def analyze_image(self, image_path, use_ocr=False):
-        """
-        Analyze image using Gemini API with fallback and usage tracking
-
-        Args:
-            image_path (str): Path to the image file
-            use_ocr (bool): Whether to enable OCR-like text extraction
-
-        Returns:
-            str: Detected product name or description
-        """
+    def _set_status(self, status):
         try:
-            # Upload the file
-            uploaded_file = self.client.files.upload(file=image_path)
+            self.redis_client.setex("gemini:last_status", 60 * 60 * 24 * 7, status)
+        except redis.exceptions.RedisError:
+            pass
 
-            # Prepare prompt
+    def _handle_error(self, error):
+        message = str(error)
+        lower = message.lower()
+        if getattr(error, 'code', None) == 429 or 'resource_exhausted' in lower or 'quota' in lower:
+            # Daily quota exhausted -> stop until the reset; otherwise a short pause
+            daily = 'per day' in lower or 'perday' in lower or 'daily' in lower
+            ttl = self._seconds_until_pacific_midnight() if daily else self.MINUTE_COOLDOWN
+            self.redis_client.setex("gemini:cooldown", ttl, 1)
+            self._set_status("quota_exhausted")
+        elif 'api key' in lower or 'api_key' in lower or 'permission' in lower:
+            # An invalid key won't fix itself; don't hammer the API until it's replaced
+            self.redis_client.setex("gemini:cooldown", 60 * 10, 1)
+            self._set_status("invalid_or_expired_key")
+        elif 'not found' in lower:
+            self._set_status("model_not_found")
+        else:
+            self._set_status("error")
+        print(f"Gemini API error: {message}")
+
+    def usage(self):
+        minute_key, day_key = self._keys()
+        return {
+            "used_today": int(self.redis_client.get(day_key) or 0),
+            "daily_limit": APP_GEMINI_RPD,
+            "per_minute_limit": APP_GEMINI_RPM,
+            "cooling_down": bool(self.redis_client.exists("gemini:cooldown")),
+        }
+
+    def status(self):
+        """
+        Health summary without calling Gemini (any API call could count against a 20/day quota).
+        Reports the outcome of the most recent real call.
+        """
+        if self.client is None:
+            return {"status": "not_configured"}
+        try:
+            last = self.redis_client.get("gemini:last_status")
+            last = last.decode() if isinstance(last, bytes) else last
+            return {"status": last or "unknown_no_calls_yet", **self.usage()}
+        except redis.exceptions.RedisError:
+            return {"status": "unknown"}
+
+    # ---- recognition ------------------------------------------------------------------
+
+    def analyze_image(self, image_bytes, mime_type='image/jpeg', use_ocr=False):
+        """
+        Returns the detected food/product name, or None if Gemini is unavailable right now
+        (not configured, over the app's quota share, cooling down after a 429, or an error).
+        """
+        if self.client is None:
+            return None
+        try:
+            if not self._reserve():
+                return None
+        except redis.exceptions.RedisError as e:
+            # Without Redis we can't count usage, so don't risk the shared quota
+            print(f"Redis error, skipping Gemini: {e}")
+            return None
+
+        try:
+            # Send the image inline instead of uploading it to the Files API
+            image_part = genai_types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
+
             prompt = ("Identify the food or product in this image. "
-                          "Return only the product name or type. "
-                          "If it's a branded product, include the brand. "
-                          "Be concise and specific.")
-
-            # Additional OCR-like text extraction if requested
+                      "Return only the product name or type, in a few words suitable for "
+                      "searching a nutrition database. "
+                      "If it's a branded product, include the brand. "
+                      "Be concise and specific. Do not add any other text.")
             if use_ocr:
                 prompt += " If there are any readable texts in the image, include them."
 
-            # Generate response
             result = self.client.models.generate_content(
-                model="gemini-2.0-flash",
-                contents=[
-                    uploaded_file,
-                    "\n\n",
-                    prompt
-                ]
+                model=GEMINI_MODEL,
+                contents=[image_part, "\n\n", prompt]
             )
-
-            tokens_used = len(result.text.split())
-
-            # Check API usage
-            if not self.track_api_usage(tokens_used):
-                # Fallback to existing method if near usage limit
-                return None
-
-            print(result.text.strip())
-            return result.text.strip()
+            text = (result.text or '').strip()
+            self._set_status("ok")
+            print(f"Gemini identified: {text}")
+            return text or None
 
         except Exception as e:
-            # Log the error, fallback to existing method
-            print(f"Gemini API error: {e}")
+            try:
+                self._handle_error(e)
+            except redis.exceptions.RedisError:
+                print(f"Gemini API error: {e}")
             return None
 
+
 class FoodImageAnalysisView(APIView):
+    """Photo -> food name (Gemini) -> USDA search."""
     parser_classes = (MultiPartParser, FormParser)
+
     def __init__(self, *args, **kwargs):
-        super().__init__(**kwargs)
+        super().__init__(*args, **kwargs)
         self.gemini_analyzer = GeminiImageAnalyzer()
 
     def post(self, request):
         if 'image' not in request.FILES:
             return Response({'error': 'No image provided'}, status=400)
 
-        use_bert, can_continue = RateLimiter.should_use_bert(request)
-
-        if getattr(request, 'api_limit_exceeded', False):
-            use_bert = True
-
-        if not can_continue:
-            return Response({
-                'error': 'Rate limit exceeded',
-                'message': 'Too many requests. Try again in 1 hour.',
-                'retry_after': 3600
-            }, status=429)
-
         image_file = request.FILES['image']
-        use_OCR = request.data.get("use_OCR", "false")
-        use_OCR = str(use_OCR).lower() in ["true", "1"]
 
-        # Generate a cache key from the image content
+        if image_file.size > MAX_IMAGE_BYTES:
+            return Response({'error': f'Image too large (max {MAX_IMAGE_BYTES // (1024 * 1024)} MB)'}, status=413)
+
+        mime_type = image_file.content_type or 'image/jpeg'
+        if not mime_type.startswith('image/'):
+            return Response({'error': 'Uploaded file is not an image'}, status=400)
+
+        use_OCR = str(request.data.get("use_OCR", "false")).lower() in ["true", "1"]
+
+        # Stable cache key from the image content.
+        # (Python's built-in hash() is randomized per process, so it can't be used across workers/restarts.)
         image_data = image_file.read()
-        image_hash = hash(image_data)
+        image_hash = hashlib.sha256(image_data).hexdigest()
         cache_key = f"food_image:{image_hash}:ocr:{use_OCR}"
 
-        # Check cache
+        # Cached photos don't count against any limit or cost a Gemini call
         cached_result = redis_client.get(cache_key)
         if cached_result:
             return Response(json.loads(cached_result))
 
-        # Reset file pointer for further processing
-        image_file.seek(0)
+        if getattr(request, 'api_limit_exceeded', False):
+            return Response({'error': PHOTO_UNAVAILABLE_MESSAGE}, status=503)
 
-        # Save the uploaded file temporarily
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as temp_file:
-            for chunk in image_file.chunks():
-                temp_file.write(chunk)
-            temp_file_path = temp_file.name
+        # Small per-person cap so one visitor can't use up the whole day's shared Gemini quota
+        if RateLimiter.hit(request, 'food_image_analysis', window=60 * 60 * 24) > MAX_IMAGE_REQUESTS_PER_IP:
+            return Response({
+                'error': 'Rate limit exceeded',
+                'message': "You've used today's photo scans. Try again tomorrow, "
+                           "or scan the barcode or search by name instead.",
+            }, status=429)
+
+        food_name = self.gemini_analyzer.analyze_image(image_data, mime_type=mime_type, use_ocr=use_OCR)
+        if not food_name:
+            # Not configured, quota share used up, cooling down after a 429, or the call failed
+            return Response({'error': PHOTO_UNAVAILABLE_MESSAGE}, status=503)
 
         try:
-            if not use_bert:
-                gemini_result = self.gemini_analyzer.analyze_image(
-                    temp_file_path,
-                    use_ocr=use_OCR
-                )
+            food_details_response = self.get_food_details(food_name)
+        except USDAError as e:
+            print(f"USDA API error: {e}")
+            return Response({'error': 'Food database is unavailable. Please try again.'}, status=502)
 
-                if gemini_result:
-                    # Use Gemini result to search
-                    processed_results = gemini_result
-                else:
-                    # Fallback to existing BERT model
-                    processed_results = self.process_image(temp_file_path, use_OCR)
-            else:
-                processed_results = self.process_image(temp_file_path, use_OCR)
-
-            if not processed_results:
-                return Response({'error': 'No food name detected from image'}, status=400)
-
-            food_details_response = self.get_food_details(processed_results, not use_bert)
-
-            # Cache the result
-            redis_client.setex(
-                cache_key,
-                CACHE_TTL * 2,  # Cache image results longer (48 hours)
-                json.dumps(food_details_response)
-            )
-
-            return Response(food_details_response)
-        finally:
-            # Clean up the temporary file
-            if os.path.exists(temp_file_path):
-                os.unlink(temp_file_path)
-
-    def process_image(self, image, use_OCR):
-        # Example image processing
-        client = Client("Jeffawe/Food_Scanner")
-        result = client.predict(
-            image=handle_file(image),
-            use_ocr=use_OCR,
-            api_name="/recognize_image"
-        )
-        print(result)
-        final_result = " ".join(self.extract_product_name(result))
-        print(final_result)
-        # Placeholder return
-        return final_result
-
-    def extract_product_name(self, text):
-        if not text:
-            return []
-
-        doc = nlp(text)
-
-        # 1. Look for brand names (usually in ALL CAPS or Title Case)
-        brands = []
-        for token in doc:
-            if token.text.isupper() or (token.text.istitle() and len(token.text) > 2):
-                # Check if part of a multi-token brand name
-                if token.i < len(doc) - 1 and doc[token.i + 1].text.istitle():
-                    brands.append(token.text + " " + doc[token.i + 1].text)
-                else:
-                    brands.append(token.text)
-
-        # 2. Extract named entities labeled as PRODUCT or ORG
-        product_ents = [ent.text for ent in doc.ents if ent.label_ in ["PRODUCT", "ORG"]]
-
-        # 3. Look for "X of Y" patterns where Y is the product
-        of_products = []
-        for token in doc:
-            if token.dep_ == "pobj" and token.head.text.lower() == "of":
-                # Get the entire phrase starting from this token
-                start_idx = token.i
-                end_idx = start_idx + 1
-
-                # Extend to include adjectives and compound nouns
-                while end_idx < len(doc) and (doc[end_idx].dep_ in ["compound", "amod", "nummod"]
-                                              or doc[end_idx].pos_ == "NOUN"):
-                    end_idx += 1
-
-                product_phrase = doc[start_idx:end_idx].text
-
-                # If we have adjectives before the object
-                prev_idx = token.i - 1
-                while prev_idx >= 0 and doc[prev_idx].dep_ in ["amod", "compound"] and doc[prev_idx].head == token:
-                    product_phrase = doc[prev_idx].text + " " + product_phrase
-                    prev_idx -= 1
-
-                of_products.append(product_phrase)
-
-        # 4. Extract noun chunks as fallback, prioritizing food items
-        container_words = ["bottle", "box", "can", "jar", "package", "container", "bag"]
-        food_nouns = []
-        other_nouns = []
-
-        for chunk in doc.noun_chunks:
-            # Filter out determiners and clean up the chunk
-            clean_chunk = " ".join([t.text for t in chunk if t.pos_ != "DET"])
-
-            if clean_chunk and len(clean_chunk.split()) <= 4:  # Reasonable length
-                if any(container in clean_chunk.lower() for container in container_words):
-                    other_nouns.append(clean_chunk)
-                else:
-                    food_nouns.append(clean_chunk)
-
-        # Prioritize results
-        if brands:
-            # If we found brands, return them along with any "of" products
-            if of_products:
-                return brands + of_products
-            return brands
-
-        if of_products:
-            return of_products
-
-        if food_nouns:
-            return food_nouns
-
-        return other_nouns
-
-    def get_food_details(self, product_name, use_llm):
-        """Calls FoodProductViewMany to fetch food details."""
-        if not product_name:
-            return {'error': 'No valid product name found'}
-
-        # We can reuse the cache from FoodProductViewMany if it exists
-        cache_key = f"food_search:{product_name}:page:{1}"
-        cached_result = redis_client.get(cache_key)
-
-        if cached_result:
-            result = json.loads(cached_result)
-            result["searchTerm"] = product_name  # Add search term to the cached result
-            return result
-
-        api_key = os.getenv('USDA_API_KEY')
-
-        headers = {
-            'accept': 'application/json',
-        }
-
-        usda_api_url = 'https://api.nal.usda.gov/fdc/v1/foods/search'
-        params = {
-            'query': product_name,
-            'pageSize': 25,
-            'pageNumber': 1,
-            'dataType': 'Foundation, Branded',
-            'sortBy': 'publishedDate',
-            'sortOrder': 'asc',
-            'api_key': api_key
-        }
-
-        response = requests.get(usda_api_url, headers=headers, params=params)
-        food_data = response.json()
-        result = {
-            "totalPages": food_data.get('totalPages', 0),
-            "searchTerm": product_name,
-            "data": [],
-            "use_llm": use_llm
-        }
-
-        for data in food_data.get('foods', []):
-            processed_data = FoodProductView.process_food_data(food_data=data)
-            result['data'].append(processed_data)
-
-        # Cache this result too
         redis_client.setex(
             cache_key,
-            CACHE_TTL,
-            json.dumps(result)
+            CACHE_TTL * 2,  # Cache image results longer (48 hours)
+            json.dumps(food_details_response)
         )
 
+        return Response(food_details_response)
+
+    def get_food_details(self, product_name):
+        """Search USDA for the detected name (shares the search cache with FoodProductViewMany)."""
+        result = dict(search_usda(product_name, 1))
+        result["searchTerm"] = product_name
         return result
 
 
-# Add a health check endpoint for Redis
 class HealthCheckView(APIView):
     def get(self, request):
         status = {
             "status": "healthy",
-            "redis": "connected"
+            "redis": "connected",
         }
 
-        # Check Redis connection
         try:
             redis_client.ping()
-        except redis.ConnectionError:
+        except redis.exceptions.RedisError:
             status["status"] = "degraded"
             status["redis"] = "disconnected"
+
+        # Last real Gemini outcome + today's usage; never calls Gemini itself
+        status["gemini"] = GeminiImageAnalyzer().status()
 
         return Response(status)

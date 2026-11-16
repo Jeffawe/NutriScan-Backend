@@ -16,7 +16,8 @@ Including another URLconf
 """
 from django.contrib import admin
 from django.urls import path
-from api.views import FoodProductView, FoodProductViewMany, FoodImageAnalysisView, home, HealthCheckView
+from api.views import (BarcodeLookupView, FoodImageAnalysisView, FoodProductView, FoodProductViewMany,
+                       HealthCheckView, home)
 
 urlpatterns = [
     path('admin/', admin.site.urls),
@@ -25,4 +26,5 @@ urlpatterns = [
     path('analyze-food/', FoodProductView.as_view()),
     path('analyze-many-food/', FoodProductViewMany.as_view()),
     path('analyze-image/', FoodImageAnalysisView.as_view()),
+    path('barcode/', BarcodeLookupView.as_view()),
 ]
