@@ -1,0 +1,25 @@
+[Unit]
+Description=ScanMyFood API (Django + gunicorn)
+Requires=scanmyfood-redis.service
+After=scanmyfood-redis.service
+
+[Container]
+Image=localhost/scanmyfood-api:latest
+ContainerName=scanmyfood-api
+Network=scanmyfood.network
+# Only reachable from the VM itself; nginx proxies to it
+PublishPort=127.0.0.1:8001:8000
+EnvironmentFile=%h/scanmyfood/api.env
+Environment=REDIS_URL=redis://scanmyfood-redis:6379/0
+# Hard memory cap: if it's ever exceeded the container is restarted, other apps are unaffected
+PodmanArgs=--memory=450m
+LogDriver=journald
+
+[Service]
+Restart=always
+RestartSec=5
+# Lower CPU priority than LiveKit / the QA apps when the single CPU is busy
+Nice=10
+
+[Install]
+WantedBy=default.target

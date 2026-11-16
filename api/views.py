@@ -44,6 +44,7 @@ PACIFIC = ZoneInfo('America/Los_Angeles')
 MAX_BARCODE_REQUESTS = int(os.getenv('MAX_BARCODE_REQUESTS', 120))  # per IP per hour
 
 GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-2.5-flash')
+GEMINI_TIMEOUT_MS = int(os.getenv('GEMINI_TIMEOUT_MS', 20000))
 MAX_IMAGE_BYTES = int(os.getenv('MAX_IMAGE_BYTES', 10 * 1024 * 1024))  # 10 MB
 # Number of public proxies in front of the app that append to X-Forwarded-For (Render: 1)
 TRUSTED_PROXY_COUNT = max(1, int(os.getenv('TRUSTED_PROXY_COUNT', 1)))
@@ -74,6 +75,48 @@ class USDAError(Exception):
     pass
 
 
+class USDABusy(USDAError):
+    """USDA rate-limited us (HTTP 429), or we're in the cool-down after it did."""
+
+
+USDA_COOLDOWN_KEY = "usda:cooldown"
+USDA_COOLDOWN_SECONDS = 60
+
+
+def usda_request(method, url, **kwargs):
+    """
+    Call USDA with a timeout. On HTTP 429 (api.data.gov allows ~1,000 requests/hour per key)
+    pause all USDA calls for a minute so we fail fast instead of piling up slow requests.
+    """
+    try:
+        if redis_client.exists(USDA_COOLDOWN_KEY):
+            raise USDABusy("USDA cool-down active")
+    except redis.exceptions.RedisError:
+        pass
+    try:
+        response = requests.request(method, url, headers={'accept': 'application/json'},
+                                    timeout=USDA_TIMEOUT, **kwargs)
+    except requests.RequestException as e:
+        raise USDAError(str(e)) from e
+    if response.status_code == 429:
+        try:
+            redis_client.setex(USDA_COOLDOWN_KEY, USDA_COOLDOWN_SECONDS, 1)
+        except redis.exceptions.RedisError:
+            pass
+        raise USDABusy("USDA rate limit reached")
+    return response
+
+
+def usda_error_response(error):
+    print(f"USDA API error: {error}")
+    if isinstance(error, USDABusy):
+        response = Response({"error": "Lots of people are searching right now. "
+                                      "Please try again in a minute."}, status=503)
+        response['Retry-After'] = str(USDA_COOLDOWN_SECONDS)
+        return response
+    return Response({"error": "Food database is unavailable. Please try again."}, status=502)
+
+
 def search_usda(product_name, page_number=1):
     """Search USDA FoodData Central (cached). Raises USDAError on upstream failure."""
     normalized = product_name.strip().lower()
@@ -90,10 +133,8 @@ def search_usda(product_name, page_number=1):
         'pageNumber': page_number,
         'dataType': USDA_DATA_TYPES,
     }
+    response = usda_request('POST', USDA_SEARCH_URL, params={'api_key': os.getenv('USDA_API_KEY')}, json=body)
     try:
-        response = requests.post(USDA_SEARCH_URL, headers={'accept': 'application/json'},
-                                 params={'api_key': os.getenv('USDA_API_KEY')}, json=body,
-                                 timeout=USDA_TIMEOUT)
         response.raise_for_status()
         food_data = response.json()
     except (requests.RequestException, ValueError) as e:
@@ -208,16 +249,15 @@ class FoodProductView(APIView):
         }
 
         try:
-            response = requests.get(USDA_FOOD_URL.format(fdc_id=product_id),
-                                    headers={'accept': 'application/json'},
-                                    params=params, timeout=USDA_TIMEOUT)
+            response = usda_request('GET', USDA_FOOD_URL.format(fdc_id=product_id), params=params)
             if response.status_code == 404:
                 return Response({"error": f"No food found with FDC ID {product_id}"}, status=404)
             response.raise_for_status()
             food_data = response.json()
+        except USDAError as e:
+            return usda_error_response(e)
         except (requests.RequestException, ValueError) as e:
-            print(f"USDA API error: {e}")
-            return Response({"error": "Food database is unavailable. Please try again."}, status=502)
+            return usda_error_response(USDAError(str(e)))
 
         processed_data = process_usda_food(food_data)
 
@@ -244,8 +284,7 @@ class FoodProductViewMany(APIView):
         try:
             result = search_usda(product_name, page_number)
         except USDAError as e:
-            print(f"USDA API error: {e}")
-            return Response({"error": "Food database is unavailable. Please try again."}, status=502)
+            return usda_error_response(e)
 
         return Response(result)
 
@@ -322,7 +361,11 @@ class GeminiImageAnalyzer:
 
         # genai.Client raises if the key is missing, so only create it when a key is configured
         self.gemini_api_key = os.getenv('GEMINI_API_KEY')
-        self.client = genai.Client(api_key=self.gemini_api_key) if self.gemini_api_key else None
+        # Timeout so a slow/hung Gemini call can't hold a server thread indefinitely
+        self.client = genai.Client(
+            api_key=self.gemini_api_key,
+            http_options=genai_types.HttpOptions(timeout=GEMINI_TIMEOUT_MS),
+        ) if self.gemini_api_key else None
 
     # ---- quota accounting -------------------------------------------------------------
 
@@ -504,8 +547,7 @@ class FoodImageAnalysisView(APIView):
         try:
             food_details_response = self.get_food_details(food_name)
         except USDAError as e:
-            print(f"USDA API error: {e}")
-            return Response({'error': 'Food database is unavailable. Please try again.'}, status=502)
+            return usda_error_response(e)
 
         redis_client.setex(
             cache_key,

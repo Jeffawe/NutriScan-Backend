@@ -1,0 +1,10 @@
+.git
+.github
+venv
+env
+__pycache__
+*.pyc
+api/.env
+.env*
+db.sqlite3
+deploy/*.env

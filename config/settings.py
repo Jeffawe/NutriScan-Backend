@@ -33,20 +33,25 @@ SECRET_KEY = os.environ.get('SECRET_KEY')
 # Parse explicitly: the raw string "False" is truthy and would enable debug mode
 DEBUG = os.environ.get('DEBUG', 'False').strip().lower() in ('1', 'true', 'yes', 'on')
 
+def env_list(name):
+    return [item.strip() for item in os.environ.get(name, '').split(',') if item.strip()]
+
+
+# Extra hosts/origins come from the environment, e.g. EXTRA_ALLOWED_HOSTS=scanmyfood.example.com
 ALLOWED_HOSTS = [
     "localhost",
     "127.0.0.1",
-    "nutriscan-backend-i822.onrender.com"
-]
+    "nutriscan-backend-i822.onrender.com",
+] + env_list('EXTRA_ALLOWED_HOSTS')
 
 CORS_ALLOWED_ORIGINS = [
     "https://scanmyfood.vercel.app",
-    "http://localhost:5173"
-]
+    "http://localhost:5173",
+] + env_list('EXTRA_CORS_ORIGINS')
 
 CSRF_TRUSTED_ORIGINS = [
-    "https://nutriscan-backend-i822.onrender.com"
-]
+    "https://nutriscan-backend-i822.onrender.com",
+] + [f"https://{host}" for host in env_list('EXTRA_ALLOWED_HOSTS')]
 
 # Application definition
 

@@ -210,7 +210,7 @@ class BarcodeViewTests(SimpleTestCase):
             {'description': 'CHEERIOS', 'gtinUpc': '016000275287', 'foodNutrients': []},
         ]})
         with mock.patch('api.openfoodfacts.requests.get', return_value=off_missing), \
-                mock.patch('api.views.requests.post', return_value=usda):
+                mock.patch('api.views.requests.request', return_value=usda):
             response = self.get('0016000275287')
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data['basic_info']['name'], 'CHEERIOS')
@@ -219,7 +219,7 @@ class BarcodeViewTests(SimpleTestCase):
         off_missing = fake_response({'status': 0}, status_code=404)
         usda_empty = fake_response({'totalPages': 0, 'foods': []})
         with mock.patch('api.openfoodfacts.requests.get', return_value=off_missing), \
-                mock.patch('api.views.requests.post', return_value=usda_empty):
+                mock.patch('api.views.requests.request', return_value=usda_empty):
             self.assertEqual(self.get('4006381333931').status_code, 404)
 
 
@@ -250,7 +250,7 @@ class ImageAnalysisViewTests(SimpleTestCase):
         usda = fake_response({'totalPages': 1, 'foods': [
             {'description': 'BANANA', 'foodNutrients': []}]})
         with mock.patch.object(views.GeminiImageAnalyzer, 'analyze_image', return_value='banana') as gemini, \
-                mock.patch('api.views.requests.post', return_value=usda):
+                mock.patch('api.views.requests.request', return_value=usda):
             first = self.post_image()
             second = self.post_image()
         self.assertEqual(first.status_code, 200)
@@ -302,3 +302,22 @@ class GeminiQuotaTests(SimpleTestCase):
     def test_default_share_is_half_of_free_tier(self):
         self.assertEqual(views.APP_GEMINI_RPD, int(views.GEMINI_FREE_RPD * 0.5))
         self.assertEqual(views.APP_GEMINI_RPM, int(views.GEMINI_FREE_RPM * 0.5))
+
+
+class UsdaBusyTests(SimpleTestCase):
+    def setUp(self):
+        self.redis = FakeRedis()
+        patcher = mock.patch.object(views, 'redis_client', self.redis)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.view = views.FoodProductViewMany.as_view()
+        self.factory = RequestFactory()
+
+    def test_429_returns_busy_and_pauses_usda(self):
+        with mock.patch('api.views.requests.request', return_value=fake_response({}, status_code=429)) as usda:
+            first = self.view(self.factory.get('/analyze-many-food/', {'name': 'apple'}))
+            second = self.view(self.factory.get('/analyze-many-food/', {'name': 'pear'}))
+        self.assertEqual(first.status_code, 503)
+        self.assertEqual(first['Retry-After'], '60')
+        self.assertEqual(second.status_code, 503)
+        usda.assert_called_once()  # second request didn't hit USDA during the cool-down

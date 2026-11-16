@@ -1,0 +1,21 @@
+[Unit]
+Description=ScanMyFood Redis (cache, rate limits, Gemini quota counters)
+
+[Container]
+Image=docker.io/library/redis:7-alpine
+ContainerName=scanmyfood-redis
+Network=scanmyfood.network
+# 64 MB cap, evict least-recently-used keys when full (everything here has a TTL anyway).
+# Snapshot every 5 min so the Gemini daily counter survives a restart.
+Exec=redis-server --maxmemory 64mb --maxmemory-policy allkeys-lru --save 300 1 --appendonly no
+Volume=scanmyfood-redis-data:/data
+PodmanArgs=--memory=128m
+LogDriver=journald
+
+[Service]
+Restart=always
+RestartSec=5
+Nice=10
+
+[Install]
+WantedBy=default.target
